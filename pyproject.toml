@@ -19,3 +19,14 @@ package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+]
+
+[tool.pytest.ini_options]
+# Add project root so tests can import the `experiments` package alongside
+# the installed `homeomorphism` package (which lives under src/).
+pythonpath = ["."]
+testpaths = ["tests"]
