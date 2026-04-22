@@ -8,6 +8,7 @@ Currently scoped to causal LMs (GPT-2 family is the only registered architecture
 - An activation-capture helper that hooks the input of any sublayer and returns its residual stream at that point.
 - A Jacobian toolkit that builds the per-token block grid $$[J]_{i,k}$$ of a sublayer via `torch.func.jacrev`, with evaluators for $$\log|\det|$$, singular-value spectra, and the full-Jacobian $$\log|\det|$$ via the block-triangular factorization.
 - Experiment 1 (`experiments/exp1_per_token_J.py`): runs the measurements across a corpus and selected sublayers, writes per-run results + manifest to disk.
+- Experiment 2 (`experiments/exp2_intrinsic_dim.py`): captures residual streams at every depth and estimates intrinsic dimension of the resulting point clouds — tests the *geometric consequence* of the homeomorphism claim (ID preserved across layers). Capture pipeline is complete; the TwoNN / ESS / participation_ratio estimator bodies are currently placeholders (see below).
 
 See `experiments_design.md` for the full experimental plan, proof dependencies, and meta-checklist mapping tests to functional coverage.
 
@@ -37,7 +38,9 @@ homeomorphism/
 │   ├── data.py         # load_texts (shakespeare)
 │   └── id_est.py       # stub for Exp 2 (TwoNN, PR, ESS)
 ├── experiments/
-│   └── exp1_per_token_J.py
+│   ├── exp1_per_token_J.py
+│   ├── exp2_intrinsic_dim.py
+│   └── exp2_dev_notes.md     # plug-in contract for whoever implements TwoNN/ESS
 ├── tests/
 │   ├── conftest.py           # toy sublayers + autograd oracle
 │   ├── test_data.py
@@ -237,6 +240,118 @@ Compare attn vs ffn at the middle of the network:
 ```bash
 uv run python -m experiments.exp1_per_token_J --layers 5.attn,5.ffn,6.attn,6.ffn
 ```
+
+---
+
+## Running Experiment 2
+
+`experiments/exp2_intrinsic_dim.py` captures residual streams at every requested depth (one forward pass per input, multi-hook), builds point clouds at three granularities, and dispatches to ID estimators. Output schema mirrors Exp 1's per-run folder layout.
+
+> **Status: estimator bodies are placeholders.** `twonn`, `ess`, and `participation_ratio` in `src/homeomorphism/id_est.py` currently validate input shape and return `NaN` (serialized as JSON `null` in the output). The rest of the pipeline — capture, depth iteration, point-cloud extraction, dispatch, manifest — is complete and tested. Real estimator bodies drop in with no other code changes; the contract lives in `experiments/exp2_dev_notes.md`.
+
+### Quick smoke run
+
+```bash
+uv run python -m experiments.exp2_intrinsic_dim \
+    --n-samples 4 --max-tokens 8 --layers 0.attn \
+    --granularity last_token --estimator twonn
+```
+
+### CLI flags
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--model` | `gpt2` | HF model id. Only `gpt2*` registered in `ARCH_SPECS`. |
+| `--weights` | `trained` | `trained` / `random_gaussian` / `random_kaiming`. |
+| `--corpus` | `shakespeare` | Only shakespeare is wired. |
+| `--n-samples` | `500` | Inputs from the corpus; design §2 calls for 500–1000 for stable TwoNN. |
+| `--max-tokens` | `64` | Truncate each input to exactly this many tokens; shorter inputs are dropped (tracked in manifest). |
+| `--layers` | `all` | `all`, single `block.kind`, or comma-list — same syntax as Exp 1. Each sublayer contributes its pre-depth and post-depth; the union is deduped so one forward pass captures every requested depth. |
+| `--granularity` | `full_stream,per_token,last_token` | Comma-list from `{full_stream, per_token, last_token}`. See below. |
+| `--estimator` | `twonn` | Comma-list from `{twonn, ess, participation_ratio}`. |
+| `--save-reps` | off | **Opt-in.** Writes `representations.npz` with per-depth `(N, T, d)` fp32 arrays. Off by default because the file can balloon to ~2 GB at 500×64×768×25 depths. Enable only when offline re-estimation matters. |
+| `--seed` | `0` | Seeds corpus sampling + random-weight init. |
+| `--device` | `cpu` | Torch device. |
+| `--output-root` | `results/exp2` | Parent dir; a `<timestamp>/` subdir is created per run. |
+
+### What the three granularities test
+
+| Granularity | One cloud per | Shape | Tests |
+|---|---|---|---|
+| `full_stream` | (depth, estimator) | `(N, T·d)` | Direct topological invariance of the full residual manifold $$\mathcal{M}^n$$ |
+| `per_token` | (depth, token_idx, estimator) | `(N, d)` × T rows | Per-position manifold $$M^n_i$$ — requires the (unstated) transversality assumption |
+| `last_token` | (depth, estimator) | `(N, d)` | "Decoder latent" manifold used at inference |
+
+### Depth indexing
+
+Pre-LN GPT-2 with $$L$$ blocks has depths `0..2L` indexing the residual stream at every sublayer boundary:
+
+- depth `2b` = block $$b$$ attn-sublayer input (`ln_1` input)
+- depth `2b+1` = block $$b$$ ffn-sublayer input (`ln_2` input) = post-attn
+- depth `2L` = `ln_f` input = post last ffn
+
+`--layers all` on GPT-2 small therefore captures 25 depths per input.
+
+### Output layout
+
+```
+results/exp2/<run_id>/
+├── config.json            # the exact CLI args passed
+├── manifest.json          # git_sha, depths_captured, input_token_ids, drop reasons, ...
+├── results.jsonl          # one row per (depth, granularity, [token_idx], estimator)
+├── representations.npz    # only if --save-reps; per-depth (N, T, d) fp32 arrays
+└── plots/                 # reserved for future plotter output
+```
+
+One row of `results.jsonl`:
+
+```json
+{
+  "depth": 12,
+  "hook_path": "transformer.h.6.ln_1",
+  "granularity": "per_token",
+  "token_idx": 3,
+  "estimator": "twonn",
+  "n_points": 500,
+  "ambient_dim": 768,
+  "id_estimate": null,       // will be a float once twonn is implemented
+  "error": null
+}
+```
+
+NaN / Inf values are serialized as JSON `null` so strict parsers (jq, duckdb, pandas) don't choke.
+
+### Examples
+
+Full sweep at the design's v1 scale (no stored reps):
+
+```bash
+uv run python -m experiments.exp2_intrinsic_dim \
+    --n-samples 500 --max-tokens 64 --layers all \
+    --granularity full_stream,per_token,last_token \
+    --estimator twonn,ess
+```
+
+Same sweep but also save raw representations for offline re-estimation:
+
+```bash
+uv run python -m experiments.exp2_intrinsic_dim \
+    --n-samples 500 --max-tokens 64 --layers all \
+    --estimator twonn,ess \
+    --save-reps
+```
+
+Random-init control (Mityagin-at-init baseline):
+
+```bash
+uv run python -m experiments.exp2_intrinsic_dim \
+    --weights random_gaussian --seed 0 \
+    --n-samples 500 --max-tokens 64 --layers all
+```
+
+### Implementing the estimators
+
+See `experiments/exp2_dev_notes.md` — it spells out the exact input/output contract, where to edit (`src/homeomorphism/id_est.py`), and what the driver does with your return value (none of exp2's plumbing needs to change).
 
 ---
 
