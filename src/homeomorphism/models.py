@@ -145,6 +145,16 @@ def load_model(
       - "trained": keep the pretrained weights.
       - "random_gaussian": re-init every parameter ~ N(0, 0.02^2) with `seed`.
       - "random_kaiming": re-init with Kaiming uniform (weights >= 2-D) and zeros (biases).
+        WARNING: this mode is degenerate for Exp 1. Kaiming init is only defined
+        for matrices, so all 1-D params go to zero — including LayerNorm scales
+        (`ln_{1,2}.weight`). With LN scale = 0 and all biases = 0, every
+        `ln(h)` is identically zero, so `g(h) = attn/mlp(0) = 0`, so
+        phi(h) = h and the sublayer Jacobian is the identity for every input,
+        layer, and token. Per-token metrics collapse to trivial constants
+        (log|det| = 0, sigma_min = sigma_max = 1, kappa = 1) and the run
+        carries no information about the Mityagin a.s.-invertibility claim.
+        Use `random_gaussian` instead as the random-init control; keep this
+        mode only as a sanity reference for "phi = id".
     """
     tokenizer = AutoTokenizer.from_pretrained(name)
     model = AutoModelForCausalLM.from_pretrained(name, torch_dtype=dtype)
@@ -155,6 +165,9 @@ def load_model(
             for p in model.parameters():
                 p.copy_(torch.randn(p.shape, generator=g, dtype=p.dtype) * 0.02)
     elif weights == "random_kaiming":
+        # NOTE: degenerate for Exp 1 — see load_model docstring. 1-D params
+        # (biases AND LayerNorm scales) end up zero, which makes ln(h) == 0,
+        # hence g(h) == 0, hence phi == id and J == I for every sublayer.
         with torch.no_grad():
             for p in model.parameters():
                 if p.dim() >= 2:
