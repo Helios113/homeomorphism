@@ -1,122 +1,268 @@
 # Homeomorphic Transformers
 
-Experimental codebase for investigating whether transformer layers act as homeomorphisms (bi-Lipschitz maps) between representation manifolds at consecutive layers.
+Experimental codebase for empirically testing the claim that each transformer residual sublayer acts as a local homeomorphism on its residual stream — concretely, that the per-token diagonal blocks of its Jacobian are non-singular almost surely (Part A of the homeomorphism claim).
+
+Currently scoped to causal LMs (GPT-2 family is the only registered architecture). The package provides:
+
+- A `Model` + `sublayer` abstraction producing faithful $$\phi : \mathbb{R}^{T \times d} \to \mathbb{R}^{T \times d}$$ closures for each residual sublayer (attn or FFN).
+- An activation-capture helper that hooks the input of any sublayer and returns its residual stream at that point.
+- A Jacobian toolkit that builds the per-token block grid $$[J]_{i,k}$$ of a sublayer via `torch.func.jacrev`, with evaluators for $$\log|\det|$$, singular-value spectra, and the full-Jacobian $$\log|\det|$$ via the block-triangular factorization.
+- Experiment 1 (`experiments/exp1_per_token_J.py`): runs the measurements across a corpus and selected sublayers, writes per-run results + manifest to disk.
+
+See `experiments_design.md` for the full experimental plan, proof dependencies, and meta-checklist mapping tests to functional coverage.
+
+---
 
 ## Setup
 
-Requires [uv](https://docs.astral.sh/uv/getting-started/installation/) for package management.
+Requires [uv](https://docs.astral.sh/uv/getting-started/installation/):
 
 ```bash
 uv sync
 ```
 
+This installs `torch`, `transformers`, and the dev dependency `pytest`.
+
+---
+
 ## Project structure
 
 ```
 homeomorphism/
-├── src/
-│   ├── homeomorphism/          # hooks & Jacobian primitives
-│   │   ├── hooks.py
-│   │   └── jacobian.py
-│   ├── activation_extractor/   # high-level activation extraction
-│   │   ├── __init__.py
-│   │   └── extractor.py
-│   └── id_est/                 # intrinsic dimension estimators (planned)
-│       └── id_estimators.py
-├── examples/
-│   └── extract_activations.py
-├── notebooks/
-│   └── testing.ipynb
+├── src/homeomorphism/
+│   ├── __init__.py
+│   ├── models.py       # Model, load_model, sublayer, tokenize, predict, generate
+│   ├── hooks.py        # capture_activation
+│   ├── jacobian.py     # BlockJacobian, build_jacobian, sublayer_slogdet
+│   ├── data.py         # load_texts (shakespeare)
+│   └── id_est.py       # stub for Exp 2 (TwoNN, PR, ESS)
+├── experiments/
+│   └── exp1_per_token_J.py
+├── tests/
+│   ├── conftest.py           # toy sublayers + autograd oracle
+│   ├── test_data.py
+│   ├── test_hooks.py
+│   ├── test_integration.py   # end-to-end on real GPT-2
+│   ├── test_jacobian.py
+│   └── test_models.py
+├── results/               # (gitignored) experiment outputs
+├── experiments_design.md  # design + claim + test meta-checklist
 └── pyproject.toml
 ```
 
-## Modules
+---
 
-### `activation_extractor`
+## Core API — a guided tour
 
-High-level activation extraction from HuggingFace causal LMs using PyTorch forward hooks.
+Each module is one file, one concern. Import and use directly.
 
-**Classes:**
+### `homeomorphism.models`
 
-- `ActivationExtractor` — main extractor. Constructed with a model, tokenizer, and a layer template string (e.g. `"transformer.h.{layer}"` for GPT-2). Exposes:
-  - `extract(input_text, config)` — run a forward pass and return activations as `ActivationData`
-  - `get_layer_module(layer)` — return the `nn.Module` for a given layer (useful for Jacobian computation)
-- `ExtractionConfig` — controls what to extract:
-  - `layers` — list of layer indices, or `None` for all layers
-  - `positions` — which token positions to keep: `"all"`, `"last"` (last non-pad), `"mean"` (masked mean), or a `list[int]` of explicit indices
-  - `return_numpy` — whether to return numpy arrays (default) or torch tensors
-- `ActivationData` — returned container with fields: `activations`, `tokens`, `token_ids`, `attention_mask`, `layers`
+Load a HF causal LM, query structure, get sublayer handles, run forward passes.
 
-**Factory:**
+```python
+from homeomorphism import models
 
-- `make_extractor(model_name)` — loads a model + tokenizer and returns a ready `ActivationExtractor`. Auto-resolves layer templates for known architectures (GPT-2, Llama, Pythia). Pass `layer_template` explicitly for other models.
+m = models.load_model("gpt2")              # trained weights (default)
+m = models.load_model("gpt2", weights="random_gaussian", seed=42)  # Mityagin-at-init control
 
-**Shape conventions:**
+models.n_blocks(m)        # 12 for GPT-2 small
+models.n_sublayers(m)     # 24 (2 per block: attn + ffn)
+models.hidden_size(m)     # 768
 
-| `positions`   | `activations` shape              |
-|---------------|----------------------------------|
-| `"all"`       | `(batch, n_layers, seq_len, D)`  |
-| `"last"`      | `(batch, n_layers, D)`           |
-| `"mean"`      | `(batch, n_layers, D)`           |
-| `list[int]`   | `(batch, n_layers, len(list), D)`|
+# Get a sublayer: block 0, attention.
+s = models.sublayer(m, block_idx=0, kind="attn")
+s.hook_path   # e.g. "transformer.h.0.ln_1" — hook here to capture input
+s.phi         # callable (T, d) -> (T, d), implements h -> h + g(h)
+
+# Inference helpers (kept for sanity checks; not used by the experiments).
+models.predict_next_token(m, "The capital of France is", top_k=5)
+models.generate(m, "Once upon a time", max_new_tokens=20)
+```
+
+The phi closures are architecture-specific and produced by `_PHI_BUILDERS`. Currently `gpt2` is registered; add `llama` / `pythia` by extending `ARCH_SPECS` and implementing their phi builders.
 
 ### `homeomorphism.hooks`
 
-Low-level hook utilities for attaching to arbitrary submodules.
+One function — grab the residual stream at a sublayer's input:
 
-- `list_module_names(model)` — list all named submodule paths
-- `get_submodule(model, path)` / `get_submodules(model, prefix, items)` / `get_modules(model, items)` — resolve submodules by dotted path or leaf name
-- `register_forward_capture_hooks(modules, cache, module_type)` — attach forward hooks to a list of modules and cache their outputs in a dict keyed by `"{module_type}_{i}"`
+```python
+from homeomorphism import hooks
+
+h = hooks.capture_activation(m, s.hook_path, "The quick brown fox", max_tokens=32)
+# h has shape (T, d), detached, on the model's device
+```
 
 ### `homeomorphism.jacobian`
 
-Per-layer Jacobian computation via `torch.autograd.functional.jacobian`.
+Build the $$T \times T$$ grid of $$d \times d$$ sub-Jacobian blocks of a sublayer at a given residual stream. Access blocks by `(output_token, input_token)`; evaluate per-block or whole-matrix quantities via methods.
 
-- `submodule_output_jacobian(model, module_path, model_inputs)` — runs a forward pass to capture a submodule's input, then computes the full Jacobian `d(output)/d(input)` for a single batch element. Returns a tensor of shape `(1, T, D, 1, T, D)` for the full-state Jacobian.
-- `remove_hooks(handles)` — clean up hook handles
+```python
+from homeomorphism import jacobian
+import torch
 
-### `id_est.id_estimators`
+bj = jacobian.build_jacobian(s.phi, h.to(torch.float32))        # scope="causal" by default
+bj[(2, 2)]                     # diagonal block J^(2) in R^{d x d}
+bj[(3, 1)]                     # off-diagonal attention coupling from token 1 to token 3
+bj.slogdet(2, 2)               # (sign, log|det|) of block (2, 2)
+bj.svdvals(2, 2)               # singular values
+bj.condition_number(2, 2)      # sigma_max / sigma_min
 
-Planned module for intrinsic dimension estimation (MLE, TwoNN). Not yet implemented.
+# Full-matrix log|det| via the block-triangular factorization (paper eq. 4):
+sign, log_abs_det = bj.full_slogdet()
 
-## Example
+# Eager evaluation in one call — returns (BlockJacobian, eval_result).
+bj, (sign, log_abs_det) = jacobian.build_jacobian(
+    s.phi, h, scope="diagonal", evaluate="full_slogdet"
+)
 
-`examples/extract_activations.py` demonstrates all extraction modes on GPT-2:
+# Or the convenience wrapper for the common case:
+sign, log_abs_det = jacobian.sublayer_slogdet(s.phi, h)
+```
+
+Scope options:
+- `"diagonal"` — only $$(i, i)$$ blocks. Cheapest. Enough for $$\log|\det|$$.
+- `"causal"` (default) — every $$(i, k)$$ with $$k \leq i$$. All nonzero blocks in a causal model.
+- `"full"` — every $$(i, k)$$ including the causally-zero upper blocks (for sanity checks).
+
+Evaluate options for the `evaluate=` flag:
+- `None` — return just the `BlockJacobian`.
+- `"full_slogdet"` — also return $$(sign, \log|\det|)$$ of the full Jacobian.
+- `"per_diagonal_slogdet"` — also return $$\{i : (sign, \log|\det|)\}$$ per diagonal.
+- `"per_block_slogdet"` — also return $$\{(i, k) : (sign, \log|\det|)\}$$ per computed block.
+
+### `homeomorphism.data`
+
+```python
+from homeomorphism.data import load_texts
+
+texts = load_texts("shakespeare", n_samples=8, chunk_chars=400, seed=0)
+```
+
+First call downloads Karpathy's tiny-shakespeare to `~/.cache/homeomorphism_data/` and samples text chunks at random offsets.
+
+---
+
+## Running Experiment 1
+
+`experiments/exp1_per_token_J.py` loops `(input × sublayer)`, measures the full sublayer $$\log|\det|$$ plus per-token breakdown and singular-value spectrum, and writes JSONL.
+
+### Quick smoke run
 
 ```bash
-uv run python -m examples.extract_activations
+uv run python -m experiments.exp1_per_token_J \
+    --model gpt2 --weights trained \
+    --corpus shakespeare --n-samples 4 --max-tokens 32 \
+    --layers 0.attn
 ```
 
-What it does:
+### CLI flags — what each controls
 
-1. Loads GPT-2 via `make_extractor("gpt2")`
-2. Extracts activations at first & last layer for a batch of two sentences (`positions="all"`)
-3. Extracts last-token representations at layers 0, 5, 11 (`positions="last"`)
-4. Extracts mean-pooled representations (`positions="mean"`)
-5. Extracts specific token indices (`positions=[0, 1]`)
-6. Extracts all layers with default config
-7. Shows how to access the underlying `nn.Module` via `get_layer_module()` for Jacobian work
+| Flag | Default | Meaning |
+|---|---|---|
+| `--model` | `gpt2` | HF model id. Only `gpt2*` families work out of the box; add new architectures via `ARCH_SPECS` in `models.py`. |
+| `--weights` | `trained` | Weight-loading mode. One of: `trained` (pretrained), `random_gaussian` (re-init every parameter $$\sim N(0, 0.02^2)$$), `random_kaiming` (Kaiming uniform). Random modes are the Mityagin-at-init controls. |
+| `--corpus` | `shakespeare` | Text corpus. Only `shakespeare` is currently wired. |
+| `--n-samples` | `4` | How many input texts to draw from the corpus. |
+| `--max-tokens` | `32` | Truncate each input to at most this many tokens. Smaller is faster; larger gives more token positions per input. |
+| `--layers` | `0.attn` | Which sublayers to measure. Three forms: `all` (every block × kind), a single `block.kind` like `5.attn`, or a comma list like `0.attn,5.ffn,11.attn`. |
+| `--seed` | `0` | Seed for corpus sampling AND for random-weight modes. |
+| `--device` | `cpu` | Torch device. |
+| `--output-root` | `results/exp1` | Parent directory; a `<timestamp>/` subdir is created per run. |
 
-Sample output:
+### Output layout
+
+Each run creates a timestamped subdirectory:
 
 ```
-Model loaded — 12 layers, device=cpu
-
-[all positions]  ActivationData(batch=2, layers=[0, 11], shape=(2, 2, 6, 768))
-  tokens[0]: ['The', ' cat', ' sat', ' on', ' the', ' mat']
-
-[last token]     ActivationData(batch=2, layers=[0, 5, 11], shape=(2, 3, 768))
-[mean pooled]    ActivationData(batch=2, layers=[0, 5, 11], shape=(2, 3, 768))
-[indices 0,1]    ActivationData(batch=1, layers=[0], shape=(1, 1, 2, 768))
-[all layers/all] ActivationData(batch=1, layers=[0, 1, ..., 11], shape=(1, 12, 6, 768))
-
-Layer 0 module type: GPT2Block
+results/exp1/<run_id>/
+├── config.json      # the exact CLI args passed
+├── manifest.json    # run metadata: git_sha, timestamps, n_rows, n_errors, sublayers_resolved, ...
+├── results.jsonl    # one JSON row per (input, sublayer) measurement
+└── plots/           # empty; reserved for future plotter output
 ```
+
+One row of `results.jsonl` (abbreviated):
+
+```json
+{
+  "input_id": 0,
+  "input_preview": "alters.\n\nPERDITA:\nOne of these is true...",
+  "block_idx": 0,
+  "sublayer_kind": "attn",
+  "n_tokens": 16,
+  "input_token_ids": [282, 1010, 13, ...],
+  "sign": -1,
+  "log_abs_det": 1586.36,
+  "per_token_log_abs_det": [113.80, 94.58, 103.08, ...],
+  "per_token_sign": [-1, 1, 1, ...],
+  "per_token_sigma_min": [1.78e-3, 3.42e-3, ...],
+  "per_token_sigma_max": [15.62, 22.72, ...],
+  "per_token_condition_number": [8754.2, 6635.8, ...],
+  "elapsed_sec": 2.58
+}
+```
+
+Identification fields (`input_id`, `input_preview`, `block_idx`, `sublayer_kind`, `n_tokens`, `input_token_ids`) come first so rows from different samples / sublayers are distinguishable at a glance.
+
+### Interpreting the numbers
+
+- `log_abs_det` > 0: sublayer locally *expands* volume; < 0: *contracts*.
+- `sign`: orientation-preserving (+1) vs orientation-flipping (−1) — irrelevant for the homeomorphism claim, which only needs $$|\det| > 0$$.
+- `per_token_sigma_min` is the main robustness signal. $$\to 0$$ means approaching singularity in at least one direction. Practically, small values warn that fp16 / int8 quantization will produce collisions along that direction (the "Robustness to quantization" section of the paper).
+- What would falsify Part A: `log_abs_det = -∞` or `sign = 0` — neither should ever appear on a well-conditioned forward pass.
+
+See §7 of `experiments_design.md` for the full post-run verification checklist.
+
+### Examples
+
+Full-network sweep on GPT-2, 8 inputs:
+
+```bash
+uv run python -m experiments.exp1_per_token_J \
+    --n-samples 8 --max-tokens 64 --layers all
+```
+
+Random-init control, 3 seeds:
+
+```bash
+for s in 1 2 3; do
+  uv run python -m experiments.exp1_per_token_J \
+      --weights random_gaussian --seed $s --layers all
+done
+```
+
+Compare attn vs ffn at the middle of the network:
+
+```bash
+uv run python -m experiments.exp1_per_token_J --layers 5.attn,5.ffn,6.attn,6.ffn
+```
+
+---
+
+## Testing
+
+```bash
+uv run pytest tests/ -v
+```
+
+51 tests, all on CPU, finishes in ~15s. Grouped by module:
+
+- `tests/test_jacobian.py` (16) — toy sublayers + autograd oracle; covers block building, causality, per-block slogdet/svd, and paper's eq. (4) on toys.
+- `tests/test_models.py` (17) — real GPT-2; covers loading, random-init determinism, config queries, phi-closure faithfulness, inference helpers.
+- `tests/test_hooks.py` (6) — real GPT-2; shape/dtype/detachment + byte-equality with manual hooks.
+- `tests/test_data.py` (5) — determinism + caching.
+- `tests/test_integration.py` (7) — end-to-end including paper's eq. (4) verified on actual GPT-2 activations.
+
+See §8 of `experiments_design.md` for a per-test breakdown and §9 for a meta-checklist showing that these tests together cover every functional step of Exp 1.
+
+---
 
 ## Dependencies
 
 - `torch >= 2.8`
 - `transformers >= 5.5.4`
-- `jupyter` (for notebooks)
+- `jupyter` (notebooks only)
+- `pytest` (dev)
 
-No `nnsight` dependency — activation extraction uses plain PyTorch forward hooks.
+Activation capture uses plain PyTorch forward hooks; results are stored as JSONL.
