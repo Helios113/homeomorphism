@@ -26,9 +26,16 @@ where = ["src"]
 dev = [
     "pytest>=9.0.3",
 ]
+topology = [
+    "ripser>=0.6.12",
+    "scikit-tda>=1.1.1",
+]
 
 [tool.pytest.ini_options]
 # Add project root so tests can import the `experiments` package alongside
 # the installed `homeomorphism` package (which lives under src/).
 pythonpath = ["."]
 testpaths = ["tests"]
+markers = [
+    "slow: marks computationally expensive tests (deselected by default)",
+]
