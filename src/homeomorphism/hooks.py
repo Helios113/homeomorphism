@@ -1,63 +1,55 @@
-import re
-from collections.abc import Iterable
-from typing import Any, Callable
+"""Activation capture utilities — run a forward pass and grab what you need.
+
+One function:
+  `capture_activation(m, hook_path, text, max_tokens=None) -> Tensor of shape (T, d)`.
+
+It tokenizes `text`, runs a single forward pass of `m.model`, captures the INPUT
+tensor at the module located at `hook_path`, strips the batch dim, and returns
+the captured residual stream without gradients. This is what the Jacobian code
+expects as its `h_input`.
+
+If you need more general hook patterns (capture multiple paths in one pass,
+capture outputs instead of inputs, etc.), extend here — keep the single-purpose
+function simple and add named siblings.
+"""
+
+from __future__ import annotations
 
 import torch
-import torch.nn as nn
+
+from .models import Model, tokenize
 
 
-def get_submodule(model: nn.Module, module_path: str) -> nn.Module:
-	"""Return a nested submodule by dotted path."""
-	return model.get_submodule(module_path)
+def capture_activation(
+    m: Model,
+    hook_path: str,
+    text: str,
+    max_tokens: int | None = None,
+) -> torch.Tensor:
+    """Run a forward pass on `text` and return the INPUT residual stream at
+    `hook_path` as a 2-D tensor of shape (T, d). No gradients; detached."""
+    module = m.model.get_submodule(hook_path)
+    captured: list[torch.Tensor] = []
 
-def get_submodules(model: nn.Module, prefix_path: str, items: list[str]) -> list[nn.Module]:
-	"""Return a nested submodule by dotted path."""
-	return [model.get_submodule(".".join([prefix_path, item_name])) for item_name in items]
-	
+    def hook(_mod, inputs, _output):  # noqa: ANN001
+        h = inputs[0] if isinstance(inputs, tuple) else inputs
+        if not isinstance(h, torch.Tensor):
+            raise TypeError(f"hook at {hook_path} got non-tensor input: {type(h)}")
+        captured.append(h.detach())
 
-def get_modules(model: nn.Module, items: list[str]) -> list[nn.Module]:
-    names = list_module_names(model)
-    module_paths = []
-    for name in names:
-        if name.split(".")[-1] in items:
-            module_paths.append(name)
-    return [model.get_submodule(module_path) for module_path in module_paths]
-            
+    handle = module.register_forward_hook(hook)
+    try:
+        input_ids = tokenize(m, text, max_tokens=max_tokens)
+        with torch.no_grad():
+            m.model(input_ids=input_ids)
+    finally:
+        handle.remove()
 
-def list_module_names(model: nn.Module) -> list[str]:
-	"""List all named modules to discover selectable sections."""
-	return [name for name, _ in model.named_modules() if name]
-
-
-def register_forward_capture_hooks(
-	modules: Iterable[nn.Module],
-	cache: dict[str, torch.Tensor],
-	module_type : str,
-	detach: bool = True,
-	hook_fn: Callable[[nn.Module, tuple[Any, ...], Any, str, dict[str, torch.Tensor], bool], None] | None = None,
-) -> list[Any]:
-	"""Attach forward hooks and cache outputs by module name.
-
-	Pass ``hook_fn`` to fully replace the default hook behavior.
-	The provided callable receives ``(module, inputs, output, key, cache, detach)``.
-	"""
-	handles: list[Any] = []
-	name_list = [f"{module_type}_{i}" for i, _ in enumerate(modules)]
-	module_list = list(modules)
-
-	for name, module in zip(name_list, module_list, strict=True):
-		# default hook behaviour
-		if hook_fn is None:
-			def hook(_mod: nn.Module, _inp: tuple[Any, ...], out: Any, key: str = name):
-				value = out[0] if isinstance(out, tuple) else out
-				if isinstance(value, torch.Tensor):
-					cache[key] = value.detach() if detach else value
-		# custom hook pass through
-		else:
-			def hook(_mod: nn.Module, _inp: tuple[Any, ...], out: Any, key: str = name):
-				hook_fn(_mod, _inp, out, key, cache, detach)
-
-		handles.append(module.register_forward_hook(hook))
-
-	return handles
-
+    if not captured:
+        raise RuntimeError(f"hook at {hook_path} did not fire")
+    h = captured[0]
+    if h.dim() != 3 or h.shape[0] != 1:
+        raise ValueError(
+            f"expected captured tensor of shape (1, T, d); got {tuple(h.shape)}"
+        )
+    return h[0]  # (T, d)
