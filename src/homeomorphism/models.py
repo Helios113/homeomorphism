@@ -13,19 +13,35 @@ and providing phi-closure builders.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Literal
 
 import torch
 import torch.nn as nn
-from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel, PreTrainedTokenizer
+from transformers import (
+    AutoConfig,
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    GPT2Config,
+    PreTrainedModel,
+    PreTrainedTokenizer,
+)
 
 from .paths import hf_cache_dir
 
 
 SublayerKind = Literal["attn", "ffn"]
 WeightsMode = Literal["trained", "random_gaussian", "random_kaiming"]
+
+# Regex patterns for custom model names:
+#   tiny-gpt2-4l-256d  -> 4 layers, 256 hidden dim
+#   micro-gpt2-6l-384d -> 6 layers, 384 hidden dim
+#   nano-gpt2-4l-128d  -> 4 layers, 128 hidden dim
+_CUSTOM_MODEL_RE = re.compile(
+    r"^(?P<prefix>tiny|micro|nano)-gpt2-(?P<layers>\d+)l-(?P<hidden>\d+)d$"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -86,6 +102,8 @@ def _detect_arch(model_name: str) -> str:
     n = model_name.lower()
     if "gpt2" in n or n == "distilgpt2":
         return "gpt2"
+    if _CUSTOM_MODEL_RE.match(n):
+        return "gpt2"
     raise ValueError(
         f"No ArchSpec registered for model_name={model_name!r}. "
         f"Extend ARCH_SPECS and _PHI_BUILDERS."
@@ -128,10 +146,47 @@ _PHI_BUILDERS: dict[tuple[str, SublayerKind], Callable[[nn.Module], Callable]] =
     ("gpt2", "ffn"): _make_gpt2_ffn_phi,
 }
 
+# ---------------------------------------------------------------------------
+# Custom tiny GPT-2 factory
+# ---------------------------------------------------------------------------
+
+
+def _build_custom_gpt2_config(model_name: str) -> GPT2Config:
+    """Parse tiny/micro/nano-gpt2-{L}l-{D}d names and return a GPT2Config."""
+    m = _CUSTOM_MODEL_RE.match(model_name)
+    if m is None:
+        raise ValueError(f"custom model name does not match pattern: {model_name!r}")
+
+    n_layer = int(m.group("layers"))
+    n_embd = int(m.group("hidden"))
+    n_head = max(1, n_embd // 64)  # keep head size ~64
+    n_inner = n_embd * 4
+
+    cfg = GPT2Config(
+        vocab_size=50257,
+        n_positions=1024,
+        n_ctx=1024,
+        n_embd=n_embd,
+        n_layer=n_layer,
+        n_head=n_head,
+        n_inner=n_inner,
+        activation_function="gelu_new",
+        resid_pdrop=0.1,
+        embd_pdrop=0.1,
+        attn_pdrop=0.1,
+        layer_norm_epsilon=1e-5,
+        initializer_range=0.02,
+        bos_token_id=50256,
+        eos_token_id=50256,
+        pad_token_id=50256,  # will be overridden later
+    )
+    return cfg
+
 
 # ---------------------------------------------------------------------------
 # Loader
 # ---------------------------------------------------------------------------
+
 
 def load_model(
     name: str = "gpt2",
@@ -157,31 +212,52 @@ def load_model(
         carries no information about the Mityagin a.s.-invertibility claim.
         Use `random_gaussian` instead as the random-init control; keep this
         mode only as a sanity reference for "phi = id".
+
+    Custom models: names matching patterns like "tiny-gpt2-4l-256d" or
+    "micro-gpt2-6l-384d" are generated from scratch and ONLY support
+    random-weighted init (weights="random_gaussian" or "random_kaiming").
     """
     cache_dir = str(hf_cache_dir())
-    tokenizer = AutoTokenizer.from_pretrained(name, cache_dir=cache_dir)
-    model = AutoModelForCausalLM.from_pretrained(name, torch_dtype=dtype, cache_dir=cache_dir)
+    arch = _detect_arch(name)
+    is_custom = _CUSTOM_MODEL_RE.match(name) is not None
 
+    # Tokenizer: custom models reuse GPT-2 tokenizer
+    tokenizer = AutoTokenizer.from_pretrained(
+        "gpt2" if is_custom else name, cache_dir=cache_dir
+    )
+
+    if is_custom:
+        if weights == "trained":
+            raise ValueError(
+                f"custom model {name!r} does not support weights='trained'; "
+                f"use 'random_gaussian' or 'random_kaiming'"
+            )
+        cfg = _build_custom_gpt2_config(name)
+        model = AutoModelForCausalLM.from_config(cfg)
+    else:
+        model = AutoModelForCausalLM.from_pretrained(
+            name, torch_dtype=dtype, cache_dir=cache_dir
+        )
+
+    # Weight re-initialisation
     if weights == "random_gaussian":
         g = torch.Generator().manual_seed(seed)
         with torch.no_grad():
             for p in model.parameters():
-                p.copy_(torch.randn(p.shape, generator=g, dtype=p.dtype) * 0.02)
+                p.copy_(torch.randn(p.shape, generator=g, dtype=dtype) * 0.02)
     elif weights == "random_kaiming":
-        # NOTE: degenerate for Exp 1 — see load_model docstring. 1-D params
-        # (biases AND LayerNorm scales) end up zero, which makes ln(h) == 0,
-        # hence g(h) == 0, hence phi == id and J == I for every sublayer.
         with torch.no_grad():
             for p in model.parameters():
                 if p.dim() >= 2:
                     nn.init.kaiming_uniform_(p, a=5**0.5)
                 else:
                     nn.init.zeros_(p)
+    elif weights == "trained" and is_custom:
+        raise ValueError(f"custom models require random init weights; got {weights!r}")
     elif weights != "trained":
         raise ValueError(f"Unknown weights mode: {weights!r}")
 
     model = model.to(device).eval()
-    arch = _detect_arch(name)
 
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token

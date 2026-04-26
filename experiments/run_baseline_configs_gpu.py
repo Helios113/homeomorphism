@@ -33,6 +33,11 @@ def _python_executable(repo_root: Path) -> str:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run baseline experiments on GPU")
     parser.add_argument("--quick", action="store_true", help="Run a small quick suite")
+    parser.add_argument(
+        "--model",
+        default="gpt2",
+        help="model name; 'gpt2' or custom small models like 'tiny-gpt2-4l-256d'",
+    )
     args = parser.parse_args()
 
     repo_root = Path(__file__).resolve().parents[1]
@@ -52,7 +57,7 @@ def main() -> None:
         py,
         "experiments/exp3_section2_baselines.py",
         "--model",
-        "gpt2",
+        args.model,
         "--weights",
         "trained",
         "--corpus",
