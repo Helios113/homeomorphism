@@ -1,8 +1,8 @@
-# Exp 2 — dev notes (temporary)
+# Exp 2 — dev notes (historical)
 
-This file is a pointer for whoever picks up the estimator implementation.
-Delete once TwoNN / ESS / participation_ratio bodies are real and this infra
-stops being placeholder-shaped. User-facing exp2 docs live in the main `README.md`.
+TwoNN / ESS / participation_ratio are now implemented in `src/homeomorphism/id_est.py`.
+This file remains as historical context for the estimator API contract and
+future extensions.
 
 ---
 

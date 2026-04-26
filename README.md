@@ -8,7 +8,7 @@ Currently scoped to causal LMs (GPT-2 family is the only registered architecture
 - An activation-capture helper that hooks the input of any sublayer and returns its residual stream at that point.
 - A Jacobian toolkit that builds the per-token block grid $$[J]_{i,k}$$ of a sublayer via `torch.func.jacrev`, with evaluators for $$\log|\det|$$, singular-value spectra, and the full-Jacobian $$\log|\det|$$ via the block-triangular factorization.
 - Experiment 1 (`experiments/exp1_per_token_J.py`): runs the measurements across a corpus and selected sublayers, writes per-run results + manifest to disk.
-- Experiment 2 (`experiments/exp2_intrinsic_dim.py`): captures residual streams at every depth and estimates intrinsic dimension of the resulting point clouds — tests the *geometric consequence* of the homeomorphism claim (ID preserved across layers). Capture pipeline is complete; the TwoNN / ESS / participation_ratio estimator bodies are currently placeholders (see below).
+- Experiment 2 (`experiments/exp2_intrinsic_dim.py`): captures residual streams at every depth and estimates intrinsic dimension of the resulting point clouds — tests the *geometric consequence* of the homeomorphism claim (ID preserved across layers).
 
 See `experiments_design.md` for the full experimental plan, proof dependencies, and meta-checklist mapping tests to functional coverage.
 
@@ -142,7 +142,7 @@ from homeomorphism.data import load_texts
 texts = load_texts("shakespeare", n_samples=8, chunk_chars=400, seed=0)
 ```
 
-First call downloads Karpathy's tiny-shakespeare to `~/.cache/homeomorphism_data/` and samples text chunks at random offsets.
+First call downloads Karpathy's tiny-shakespeare to the project-local cache under `.cache/homeomorphism_data/` and samples text chunks at random offsets.
 
 ---
 
@@ -247,7 +247,7 @@ uv run python -m experiments.exp1_per_token_J --layers 5.attn,5.ffn,6.attn,6.ffn
 
 `experiments/exp2_intrinsic_dim.py` captures residual streams at every requested depth (one forward pass per input, multi-hook), builds point clouds at three granularities, and dispatches to ID estimators. Output schema mirrors Exp 1's per-run folder layout.
 
-> **Status: estimator bodies are placeholders.** `twonn`, `ess`, and `participation_ratio` in `src/homeomorphism/id_est.py` currently validate input shape and return `NaN` (serialized as JSON `null` in the output). The rest of the pipeline — capture, depth iteration, point-cloud extraction, dispatch, manifest — is complete and tested. Real estimator bodies drop in with no other code changes; the contract lives in `experiments/exp2_dev_notes.md`.
+`twonn`, `ess`, and `participation_ratio` in `src/homeomorphism/id_est.py` are implemented and return numeric estimates for valid point clouds.
 
 ### Quick smoke run
 

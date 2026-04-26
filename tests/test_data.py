@@ -9,7 +9,11 @@ Validates:
 
 from __future__ import annotations
 
+from pathlib import Path
+
+from homeomorphism import data as data_mod
 from homeomorphism.data import load_texts
+from homeomorphism.paths import project_root
 
 
 def test_load_texts_returns_requested_count() -> None:
@@ -42,3 +46,11 @@ def test_load_texts_caches_file() -> None:
     _ = load_texts("shakespeare", n_samples=1, chunk_chars=50, seed=0)
     # No assertion beyond completion; if download logic is broken we'd get
     # an HTTP error on the second call or corrupt cache.
+
+
+def test_data_cache_is_project_local() -> None:
+    cache = data_mod._cache_dir()
+    root = project_root().resolve()
+    assert root in cache.resolve().parents or cache.resolve() == root
+    assert str(cache).startswith(str(root / ".cache"))
+    assert Path(cache).exists()

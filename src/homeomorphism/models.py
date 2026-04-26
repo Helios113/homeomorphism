@@ -21,6 +21,8 @@ import torch
 import torch.nn as nn
 from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel, PreTrainedTokenizer
 
+from .paths import hf_cache_dir
+
 
 SublayerKind = Literal["attn", "ffn"]
 WeightsMode = Literal["trained", "random_gaussian", "random_kaiming"]
@@ -98,10 +100,10 @@ def _make_gpt2_attn_phi(block: nn.Module) -> Callable[[torch.Tensor], torch.Tens
     """phi(h) = h + block.attn(block.ln_1(h)) for a GPT-2 block. Causal mask is
     handled inside GPT2Attention via its registered bias buffer."""
 
-    def phi(h: torch.Tensor) -> torch.Tensor:
+    def phi(h: torch.Tensor, **kwargs: Any) -> torch.Tensor:
         h3 = h.unsqueeze(0)  # (1, T, d)
         normed = block.ln_1(h3)
-        attn_out = block.attn(normed)
+        attn_out = block.attn(normed, **kwargs)
         if isinstance(attn_out, tuple):
             attn_out = attn_out[0]
         return (h3 + attn_out).squeeze(0)
@@ -112,10 +114,10 @@ def _make_gpt2_attn_phi(block: nn.Module) -> Callable[[torch.Tensor], torch.Tens
 def _make_gpt2_ffn_phi(block: nn.Module) -> Callable[[torch.Tensor], torch.Tensor]:
     """phi(h) = h + block.mlp(block.ln_2(h)) for a GPT-2 block."""
 
-    def phi(h: torch.Tensor) -> torch.Tensor:
+    def phi(h: torch.Tensor, **kwargs: Any) -> torch.Tensor:
         h3 = h.unsqueeze(0)
         normed = block.ln_2(h3)
-        ffn_out = block.mlp(normed)
+        ffn_out = block.mlp(normed, **kwargs)
         return (h3 + ffn_out).squeeze(0)
 
     return phi
@@ -156,8 +158,9 @@ def load_model(
         Use `random_gaussian` instead as the random-init control; keep this
         mode only as a sanity reference for "phi = id".
     """
-    tokenizer = AutoTokenizer.from_pretrained(name)
-    model = AutoModelForCausalLM.from_pretrained(name, torch_dtype=dtype)
+    cache_dir = str(hf_cache_dir())
+    tokenizer = AutoTokenizer.from_pretrained(name, cache_dir=cache_dir)
+    model = AutoModelForCausalLM.from_pretrained(name, torch_dtype=dtype, cache_dir=cache_dir)
 
     if weights == "random_gaussian":
         g = torch.Generator().manual_seed(seed)

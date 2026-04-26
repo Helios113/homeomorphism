@@ -18,6 +18,7 @@ import pytest
 import torch
 
 from homeomorphism import models
+from homeomorphism.paths import hf_cache_dir, project_root
 
 
 # ---------------------------------------------------------------------------
@@ -44,6 +45,13 @@ def test_load_gpt2_returns_model_dataclass(gpt2_trained: models.Model) -> None:
     assert gpt2_trained.arch == "gpt2"
     assert gpt2_trained.model is not None
     assert gpt2_trained.tokenizer is not None
+
+
+def test_hf_cache_dir_is_project_local() -> None:
+    cache = hf_cache_dir().resolve()
+    root = project_root().resolve()
+    assert root in cache.parents or cache == root
+    assert str(cache).startswith(str(root / ".cache"))
 
 
 def test_load_unknown_model_raises() -> None:

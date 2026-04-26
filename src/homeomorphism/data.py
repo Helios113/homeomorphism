@@ -1,7 +1,8 @@
 """Text corpus loading.
 
 Currently supports:
-  - "shakespeare": Karpathy's tiny-shakespeare; downloaded to ~/.cache on first use.
+    - "shakespeare": Karpathy's tiny-shakespeare; downloaded to project-local
+        cache on first use.
 
 Add new corpora by extending `_CORPORA` with a URL and handling the fetch.
 """
@@ -12,6 +13,8 @@ import random
 import urllib.request
 from pathlib import Path
 from typing import Literal
+
+from .paths import corpus_cache_dir
 
 CorpusName = Literal["shakespeare"]
 
@@ -24,9 +27,7 @@ _CORPORA: dict[CorpusName, str] = {
 
 
 def _cache_dir() -> Path:
-    cache = Path.home() / ".cache" / "homeomorphism_data"
-    cache.mkdir(parents=True, exist_ok=True)
-    return cache
+    return corpus_cache_dir()
 
 
 def _download(name: CorpusName) -> str:

@@ -1,45 +1,41 @@
-"""Experiment 1: per-sublayer full |det J| (and singular-value summary) across
-inputs and selected sublayers, for Part A of the homeomorphism claim.
+"""Baseline Experiment 1: Topological Initialisation.
 
-Per-row output (results.jsonl):
+Measures per-sublayer Jacobian properties (log|det J|, condition number) when the
+model uses topological initialisation: random_gaussian weight re-init with norm
+affine reset (weight→1, bias→0).
+
+Output schema (results.jsonl):
   {
-    "input_id": int,                 # index into the corpus
-    "input_preview": str,            # first 50 chars of the input
-    "n_tokens": int,                 # tokenized length T
-    "block_idx": int,                # transformer block index
+    "input_id": int,
+    "input_preview": str,
+    "n_tokens": int,
+    "baseline": "topological_initialisation",
+    "block_idx": int,
     "sublayer_kind": "attn" | "ffn",
-    "sign": int,                     # sign of det(full Jacobian)
-    "log_abs_det": float,            # log|det(full J)|  (= sum_i log|det J^(i)|)
-    "per_token_log_abs_det": [float, ...],  # one per token i
-    "per_token_sign": [int, ...],           # one per token i
-    "per_token_sigma_min": [float, ...],    # smallest singular value of each J^(i)
-    "per_token_sigma_max": [float, ...],    # largest singular value of each J^(i)
-    "per_token_condition_number": [float, ...],  # sigma_max / sigma_min
+    "sign": int,
+    "log_abs_det": float,
+    "per_token_log_abs_det": [float, ...],
+    "per_token_sign": [int, ...],
+    "per_token_sigma_min": [float, ...],
+    "per_token_sigma_max": [float, ...],
+    "per_token_condition_number": [float, ...],
+    "kappa_alert_threshold": float,
+    "n_kappa_alert": int,
+    "kappa_alert_fraction": float,
+    "n_invalid_condition_number": int,
     "elapsed_sec": float,
   }
 
-Run layout (folder per run):
-  results/exp1/<run_id>/
-    config.json      - CLI args that produced this run
-    manifest.json    - metadata + counts + git sha + timings
-    results.jsonl    - per-row measurements (as above)
-    plots/           - created on demand by the plotter script
+Run layout:
+  results/baseline_topological/<run_id>/
+    config.json
+    manifest.json
+    results.jsonl
 
-CLI
----
-    uv run python -m experiments.exp1_per_token_J \\
-        --model gpt2 --weights trained \\
-        --corpus shakespeare --n-samples 4 --max-tokens 32 \\
-        --layers 0.attn
-
-    # several sublayers:
-    --layers 0.attn,0.ffn,5.attn,11.ffn
-
-    # the whole model:
-    --layers all
-
-    # random-init control (Mityagin at init):
-    --weights random_gaussian --seed 42
+CLI:
+  python experiments/baseline_exp_1_topological.py \\
+    --model gpt2 --n-samples 10 --max-tokens 32 \\
+    --layers all --seed 42
 """
 
 from __future__ import annotations
@@ -48,57 +44,24 @@ import argparse
 import json
 import subprocess
 import time
-from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
+if __package__ is None or __package__ == "":
+    import sys
+
+    sys.path.append(str(Path(__file__).resolve().parents[1]))
+
 import torch
 
-from homeomorphism import hooks, jacobian, models
+from homeomorphism import hooks, jacobian, models, interventions
 from homeomorphism.data import load_texts
 from homeomorphism.models import SublayerKind
 
+from experiments.exp1_per_token_J import resolve_sublayers
 
 _KAPPA_ALERT_THRESHOLD = 1e8
 
-
-# ---------------------------------------------------------------------------
-# Sublayer-spec parsing
-# ---------------------------------------------------------------------------
-
-def resolve_sublayers(n_blocks: int, spec: str) -> list[tuple[int, SublayerKind]]:
-    """Parse --layers into [(block_idx, kind), ...].
-
-    Accepted forms:
-      "all"                         - every (block, kind) pair
-      "0.attn"                      - single sublayer
-      "0.attn,5.ffn,11.attn"        - explicit comma-list
-    """
-    spec = spec.strip()
-    if spec == "all":
-        return [(b, k) for b in range(n_blocks) for k in ("attn", "ffn")]
-
-    result: list[tuple[int, SublayerKind]] = []
-    for item in spec.split(","):
-        item = item.strip()
-        if "." not in item:
-            raise ValueError(f"malformed spec {item!r}; expected 'block.kind'")
-        block_str, kind_str = item.split(".", 1)
-        try:
-            block_idx = int(block_str)
-        except ValueError as e:
-            raise ValueError(f"block index not int: {block_str!r}") from e
-        if not 0 <= block_idx < n_blocks:
-            raise ValueError(f"block_idx {block_idx} out of range [0, {n_blocks})")
-        if kind_str not in ("attn", "ffn"):
-            raise ValueError(f"sublayer kind must be 'attn' or 'ffn'; got {kind_str!r}")
-        result.append((block_idx, kind_str))  # type: ignore[arg-type]
-    return result
-
-
-# ---------------------------------------------------------------------------
-# One measurement
-# ---------------------------------------------------------------------------
 
 def measure_sublayer(
     m: models.Model,
@@ -107,12 +70,7 @@ def measure_sublayer(
     kind: SublayerKind,
     max_tokens: int,
 ) -> dict[str, Any]:
-    """Capture h^n at (block_idx, kind); return per-token + full slogdet + SVD summary.
-
-    The returned row starts with the identifying fields (input_id must be
-    filled by the caller) so that differences across samples are visible
-    at a glance when rows are grouped by (block_idx, sublayer_kind).
-    """
+    """Capture h^n at (block_idx, kind); return per-token + full slogdet + SVD summary."""
     t0 = time.time()
     sub = models.sublayer(m, block_idx, kind)
     input_ids = models.tokenize(m, text, max_tokens=max_tokens)
@@ -150,17 +108,14 @@ def measure_sublayer(
     for s in per_token_sign:
         full_sign *= s
 
-    # Identification fields come first so different-sample rows stand out visually.
     return {
-        # -- identification --
         "block_idx": block_idx,
         "sublayer_kind": kind,
         "n_tokens": T,
-        "input_token_ids": input_ids[0].tolist(),  # full fingerprint of what went in
-        # -- full-sublayer summary --
+        "baseline": "topological_initialisation",
+        "input_token_ids": input_ids[0].tolist(),
         "sign": full_sign,
         "log_abs_det": full_log,
-        # -- per-token detail --
         "per_token_log_abs_det": per_token_log,
         "per_token_sign": per_token_sign,
         "per_token_sigma_min": per_token_sigma_min,
@@ -170,14 +125,9 @@ def measure_sublayer(
         "n_kappa_alert": n_kappa_alert,
         "kappa_alert_fraction": float(n_kappa_alert / T if T > 0 else 0.0),
         "n_invalid_condition_number": n_invalid_cond,
-        # -- runtime --
         "elapsed_sec": round(time.time() - t0, 3),
     }
 
-
-# ---------------------------------------------------------------------------
-# Run driver
-# ---------------------------------------------------------------------------
 
 def _git_sha() -> str | None:
     try:
@@ -188,19 +138,18 @@ def _git_sha() -> str | None:
         return None
 
 
-def run_exp1(
+def run(
     *,
     model_name: str,
-    weights: str,
-    corpus: str,
     n_samples: int,
     max_tokens: int,
     layers_spec: str,
     seed: int,
     device: str,
     output_root: Path,
+    corpus: str,
 ) -> Path:
-    """Run Exp 1; return path to the run directory."""
+    """Run topological initialisation baseline; return path to the run directory."""
     run_id = time.strftime("%Y%m%d_%H%M%S")
     run_dir = output_root / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -209,10 +158,9 @@ def run_exp1(
     manifest_path = run_dir / "manifest.json"
     config_path = run_dir / "config.json"
 
-    # Save config (exactly what was passed in)
     config = {
         "model_name": model_name,
-        "weights": weights,
+        "baseline": "topological_initialisation",
         "corpus": corpus,
         "n_samples": n_samples,
         "max_tokens": max_tokens,
@@ -222,10 +170,16 @@ def run_exp1(
     }
     config_path.write_text(json.dumps(config, indent=2))
 
-    print(f"[exp1] run_dir = {run_dir}")
+    print(f"[baseline_topological] run_dir = {run_dir}")
 
-    # --- Load ---
-    m = models.load_model(model_name, weights=weights, seed=seed, device=device)  # type: ignore[arg-type]
+    # Load model with topological_initialisation baseline
+    m = interventions.load_model_for_baseline(
+        model_name=model_name,
+        weights="trained",
+        baseline="topological_initialisation",
+        seed=seed,
+        device=device,
+    )
     sublayers = resolve_sublayers(models.n_blocks(m), layers_spec)
     texts = load_texts(
         corpus,  # type: ignore[arg-type]
@@ -246,7 +200,6 @@ def run_exp1(
         "start_time_epoch": time.time(),
     }
 
-    # --- Measure ---
     n_rows = 0
     n_errors = 0
     total_tokens_measured = 0
@@ -265,7 +218,6 @@ def run_exp1(
                     n_errors += 1
                     print(f"  [ERR] input {input_id}, {block_idx}.{kind}: {type(e).__name__}: {e}")
                     continue
-                # Prepend sample identity so it leads the row on disk and at a glance.
                 ordered = {
                     "input_id": input_id,
                     "input_preview": text[:50],
@@ -285,7 +237,6 @@ def run_exp1(
                     f"({row['elapsed_sec']:.1f}s)"
                 )
 
-    # --- Finalize ---
     manifest["end_time_utc"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     manifest["end_time_epoch"] = time.time()
     manifest["duration_sec"] = round(time.time() - t_run, 1)
@@ -300,23 +251,14 @@ def run_exp1(
     manifest["total_invalid_condition_numbers"] = total_invalid_conds
     manifest_path.write_text(json.dumps(manifest, indent=2))
 
-    print(f"\n[exp1] done: {n_rows} rows, {n_errors} errors, {manifest['duration_sec']}s total")
-    print(f"[exp1] outputs in {run_dir}")
+    print(f"\n[baseline_topological] done: {n_rows} rows, {n_errors} errors, {manifest['duration_sec']}s total")
+    print(f"[baseline_topological] outputs in {run_dir}")
     return run_dir
 
 
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
-
 def _build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="Exp 1: per-sublayer log|det J| on a causal LM.")
+    p = argparse.ArgumentParser(description="Baseline Exp 1: Topological Initialisation")
     p.add_argument("--model", default="gpt2")
-    p.add_argument(
-        "--weights",
-        default="trained",
-        choices=["trained", "random_gaussian", "random_kaiming"],
-    )
     p.add_argument("--corpus", default="shakespeare")
     p.add_argument("--n-samples", type=int, default=4)
     p.add_argument("--max-tokens", type=int, default=32)
@@ -327,15 +269,14 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", default="cpu")
-    p.add_argument("--output-root", type=Path, default=Path("results/exp1"))
+    p.add_argument("--output-root", type=Path, default=Path("results/baseline_topological"))
     return p
 
 
 def main() -> None:
     args = _build_parser().parse_args()
-    run_exp1(
+    run(
         model_name=args.model,
-        weights=args.weights,
         corpus=args.corpus,
         n_samples=args.n_samples,
         max_tokens=args.max_tokens,
