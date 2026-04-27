@@ -26,7 +26,7 @@ import argparse
 import subprocess
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 # All model names from SMALL_MODELS.md
@@ -55,7 +55,7 @@ BASELINE_GROUPS = {
         "n_samples": 256,
         "max_tokens": 64,
         "granularity": "last_token",
-        "estimator": "twonn,participation_ratio",
+        "estimator": "twonn,ess,participation_ratio",
         "overlap_k": 10,
     },
 }
@@ -65,7 +65,7 @@ DEFAULT_SEED = 0
 DEVICE = "cuda"  # requires CUDA
 
 EXPERIMENT_SCRIPT = "experiments/exp3_section2_baselines.py"
-REPO_ROOT = Path(__file__).resolve().parent
+REPO_ROOT = Path(__file__).resolve().parents[1]
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -104,6 +104,7 @@ def _run(cmd: list[str], quiet: bool = False) -> None:
 def run_baseline_for_model(
     model_name: str,
     group_key: str,
+    output_root: Path,
     seed: int,
     device: str,
     corpus: str,
@@ -112,8 +113,8 @@ def run_baseline_for_model(
     group_cfg = BASELINE_GROUPS[group_key]
     weight_mode = _weight_mode_for_model(model_name)
 
-    ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-    out_dir = REPO_ROOT / f"results/baselines/{group_key}/{model_name}/{ts}"
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    out_dir = output_root / f"{group_key}/{model_name}/{ts}"
 
     print(f"\n{'='*70}")
     print(f"Model: {model_name}  Group: {group_key}  Weights: {weight_mode}")
@@ -148,6 +149,8 @@ def main() -> None:
                    help="Comma-separated model names (default: all)")
     p.add_argument("--groups", default="groupA,groupB",
                    help="Baseline groups to run: groupA,groupB (default: both)")
+    p.add_argument("--output-root", type=Path, default=Path("results/baselines"),
+                   help="Base output directory (default: results/baselines)")
     p.add_argument("--seed", type=int, default=DEFAULT_SEED)
     p.add_argument("--device", default=DEVICE)
     p.add_argument("--corpus", default=DEFAULT_CORPUS)
@@ -173,11 +176,12 @@ def main() -> None:
         if g not in BASELINE_GROUPS:
             raise ValueError(f"Unknown group: {g!r}. Known: {list(BASELINE_GROUPS)}")
 
-    print(f"[INFO] Models : {models}")
-    print(f"[INFO] Groups : {groups}")
-    print(f"[INFO] Device : {args.device}")
-    print(f"[INFO] Corpus : {args.corpus}")
-    print(f"[INFO] Quick  : {args.quick}")
+    print(f"[INFO] Models    : {models}")
+    print(f"[INFO] Groups    : {groups}")
+    print(f"[INFO] Output-   : {args.output_root}")
+    print(f"[INFO] Device    : {args.device}")
+    print(f"[INFO] Corpus    : {args.corpus}")
+    print(f"[INFO] Quick     : {args.quick}")
 
     total = len(models) * len(groups)
     run_idx = 0
@@ -196,6 +200,7 @@ def main() -> None:
                 run_baseline_for_model(
                     model_name=model_name,
                     group_key=group_key,
+                    output_root=args.output_root,
                     seed=args.seed,
                     device=args.device,
                     corpus=args.corpus,
