@@ -16,7 +16,6 @@ Output schema (results.jsonl):
      }
   2. ID estimation row (multi-depth):
      {
-       "input_id": int,
        "baseline": "syntactic_disintegration",
        "measurement_type": "id_estimation",
        "depth": int,
@@ -54,6 +53,7 @@ import torch
 from homeomorphism import jacobian, models, interventions
 from homeomorphism.data import load_texts
 from homeomorphism.id_est import EstimatorName, estimate_id
+from homeomorphism.interventions import PreparedInput
 from homeomorphism.models import SublayerKind
 
 from experiments.exp2_intrinsic_dim import (
@@ -70,37 +70,19 @@ _KAPPA_ALERT_THRESHOLD = 1e8
 
 def measure_sublayer(
     m: models.Model,
-    text: str,
+    prepared: PreparedInput,
     block_idx: int,
     kind: SublayerKind,
-    max_tokens: int,
-    baseline: str,
-    root_seed: int,
-    sample_index: int,
 ) -> dict[str, Any]:
     """Measure per-token Jacobian for a sublayer with baseline-prepared input."""
     t0 = time.time()
     sub = models.sublayer(m, block_idx, kind)
-    
-    # Get the baseline-prepared input (permuted tokens)
-    prepared = interventions.build_prepared_input(
-        m=m,
-        text=text,
-        max_tokens=max_tokens,
-        baseline=baseline,  # type: ignore
-        root_seed=root_seed,
-        sample_index=sample_index,
-    )
 
     # Capture activation with permuted tokens from prepared forward kwargs.
     captured = capture_multi_with_prepared_input(
         m,
         [sub.hook_path],
-        text,
-        max_tokens=max_tokens,
-        baseline=baseline,
-        root_seed=root_seed,
-        sample_index=sample_index,
+        forward_kwargs=prepared.forward_kwargs,
     )
     h = captured[sub.hook_path].to(torch.float32)
     T, _d = h.shape
@@ -161,13 +143,10 @@ def measure_sublayer(
 def capture_multi_with_prepared_input(
     m: models.Model,
     paths: list[str],
-    text: str,
-    max_tokens: int,
-    baseline: str,
-    root_seed: int,
-    sample_index: int,
+    *,
+    forward_kwargs: dict[str, torch.Tensor],
 ) -> dict[str, torch.Tensor]:
-    """Run one forward pass with baseline-prepared input; capture at each path."""
+    """Run one forward pass from prepared kwargs; capture at each path."""
     captured: dict[str, list[torch.Tensor]] = {p: [] for p in paths}
     handles = []
 
@@ -186,16 +165,8 @@ def capture_multi_with_prepared_input(
         handles.append(module.register_forward_hook(_make_hook(p)))
 
     try:
-        prepared = interventions.build_prepared_input(
-            m=m,
-            text=text,
-            max_tokens=max_tokens,
-            baseline=baseline,  # type: ignore
-            root_seed=root_seed,
-            sample_index=sample_index,
-        )
         with torch.no_grad():
-            m.model(**prepared.forward_kwargs)
+            m.model(**forward_kwargs)
     finally:
         for h in handles:
             h.remove()
@@ -209,6 +180,26 @@ def capture_multi_with_prepared_input(
             raise ValueError(f"unexpected tensor shape at {p!r}: {tuple(h.shape)}")
         out[p] = h[0].to(torch.float32).cpu()
     return out
+
+
+def _parse_depths_spec(depths_spec: str, n_blocks: int, sublayers: list[tuple[int, SublayerKind]]) -> list[int]:
+    if depths_spec.strip().lower() == "all":
+        return list(range(2 * n_blocks + 1))
+    depths: list[int] = []
+    for item in depths_spec.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            d = int(item)
+        except ValueError as e:
+            raise ValueError(f"depth must be int, got {item!r}") from e
+        if d < 0 or d > 2 * n_blocks:
+            raise ValueError(f"depth {d} out of range [0, {2 * n_blocks}]")
+        depths.append(d)
+    if depths:
+        return sorted(set(depths))
+    return sublayer_depths(sublayers)
 
 
 def run(
@@ -254,10 +245,7 @@ def run(
     
     # Parse layers and depths
     sublayers = resolve_sublayers(L, layers_spec)
-    if depths_spec.lower() == "all":
-        depths = list(range(2 * L + 1))
-    else:
-        depths = sublayer_depths(sublayers)
+    depths = _parse_depths_spec(depths_spec, L, sublayers)
     paths = [depth_to_hook_path(m, d) for d in depths]
     path_by_depth = dict(zip(depths, paths))
 
@@ -290,18 +278,23 @@ def run(
         for input_id, text in enumerate(texts):
             print(f"\n=== input {input_id} === preview: {text[:60]!r}")
 
+            prepared = interventions.build_prepared_input(
+                m=m,
+                text=text,
+                max_tokens=max_tokens,
+                baseline="syntactic_disintegration",
+                root_seed=seed,
+                sample_index=input_id,
+            )
+
             # Measure Jacobians
             for block_idx, kind in sublayers:
                 try:
                     row = measure_sublayer(
                         m,
-                        text=text,
+                        prepared=prepared,
                         block_idx=block_idx,
                         kind=kind,
-                        max_tokens=max_tokens,
-                        baseline="syntactic_disintegration",
-                        root_seed=seed,
-                        sample_index=input_id,
                     )
                 except Exception as e:  # noqa: BLE001
                     print(f"  [ERR] Jacobian {block_idx}.{kind}: {type(e).__name__}: {e}")
@@ -322,11 +315,7 @@ def run(
                 captured = capture_multi_with_prepared_input(
                     m,
                     paths,
-                    text,
-                    max_tokens=max_tokens,
-                    baseline="syntactic_disintegration",
-                    root_seed=seed,
-                    sample_index=input_id,
+                    forward_kwargs=prepared.forward_kwargs,
                 )
             except Exception as e:  # noqa: BLE001
                 dropped.append({"input_id": input_id, "reason": f"{type(e).__name__}: {e}"})
@@ -346,8 +335,7 @@ def run(
             for depth_, path in path_by_depth.items():
                 buf[depth_].append(captured[path])
 
-            ids = models.tokenize(m, text, max_tokens=max_tokens)[0].tolist()
-            input_ids_kept.append(ids)
+            input_ids_kept.append(prepared.token_ids[0].tolist())
 
         # ID estimation
         N = len(input_ids_kept)

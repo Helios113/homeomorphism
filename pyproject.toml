@@ -39,6 +39,7 @@ topology = [
 # the installed `homeomorphism` package (which lives under src/).
 pythonpath = ["."]
 testpaths = ["tests"]
+python_files = ["test_*.py", "baseline_test_*.py"]
 markers = [
     "slow: marks computationally expensive tests (deselected by default)",
 ]

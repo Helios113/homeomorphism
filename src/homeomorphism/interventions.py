@@ -202,8 +202,11 @@ def topological_init_calibration(
         device=dev,
     )
     with torch.no_grad():
-        out = m.model(inputs_embeds=eps)
-    h = out.last_hidden_state
+        out = m.model(inputs_embeds=eps, output_hidden_states=True)
+    # `hidden_states` tuple includes embedding output + all layer outputs.
+    # The final element is the output after the last layer-norm, which is the
+    # residual stream entering the LM head. That's what we want.
+    h = out.hidden_states[-1]  # shape (1, 1, d_model)
     return float(torch.linalg.vector_norm(h, dim=-1).mean().item())
 
 

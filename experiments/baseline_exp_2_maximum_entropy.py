@@ -6,7 +6,6 @@ embeddings.
 
 Output schema (results.jsonl):
   {
-    "input_id": int,
     "baseline": "maximum_entropy_injection",
     "depth": int,
     "hook_path": str,
@@ -17,7 +16,6 @@ Output schema (results.jsonl):
     "ambient_dim": int,
     "id_estimate": float | null,
     "error": str | null,
-    "elapsed_sec": float,
   }
 
 Run layout:
@@ -51,6 +49,7 @@ import torch
 from homeomorphism import models, interventions
 from homeomorphism.data import load_texts
 from homeomorphism.id_est import EstimatorName, estimate_id
+from homeomorphism.interventions import PreparedInput
 
 from experiments.exp2_intrinsic_dim import (
     sublayer_depths,
@@ -66,13 +65,10 @@ Granularity = Literal["full_stream", "per_token", "last_token"]
 def capture_multi_with_prepared_input(
     m: models.Model,
     paths: list[str],
-    text: str,
-    max_tokens: int,
-    baseline: str,
-    root_seed: int,
-    sample_index: int,
+    *,
+    forward_kwargs: dict[str, torch.Tensor],
 ) -> dict[str, torch.Tensor]:
-    """Run one forward pass with baseline-prepared input; capture at each path.
+    """Run one forward pass from prepared kwargs; capture at each path.
 
     Returns {path: Tensor[T, d] in fp32}. Raises if any hook doesn't fire.
     """
@@ -94,16 +90,8 @@ def capture_multi_with_prepared_input(
         handles.append(module.register_forward_hook(_make_hook(p)))
 
     try:
-        prepared = interventions.build_prepared_input(
-            m=m,
-            text=text,
-            max_tokens=max_tokens,
-            baseline=baseline,  # type: ignore
-            root_seed=root_seed,
-            sample_index=sample_index,
-        )
         with torch.no_grad():
-            m.model(**prepared.forward_kwargs)
+            m.model(**forward_kwargs)
     finally:
         for h in handles:
             h.remove()
@@ -183,15 +171,19 @@ def run(
     t_cap = time.time()
 
     for input_id, text in enumerate(texts):
+        prepared: PreparedInput = interventions.build_prepared_input(
+            m=m,
+            text=text,
+            max_tokens=max_tokens,
+            baseline="maximum_entropy_injection",
+            root_seed=seed,
+            sample_index=input_id,
+        )
         try:
             captured = capture_multi_with_prepared_input(
                 m,
                 paths,
-                text,
-                max_tokens=max_tokens,
-                baseline="maximum_entropy_injection",
-                root_seed=seed,
-                sample_index=input_id,
+                forward_kwargs=prepared.forward_kwargs,
             )
         except Exception as e:  # noqa: BLE001
             dropped.append({"input_id": input_id, "reason": f"{type(e).__name__}: {e}"})
@@ -211,8 +203,7 @@ def run(
         for depth_, path in path_by_depth.items():
             buf[depth_].append(captured[path])
 
-        ids = models.tokenize(m, text, max_tokens=max_tokens)[0].tolist()
-        input_ids_kept.append(ids)
+        input_ids_kept.append(prepared.token_ids[0].tolist())
 
         if (input_id + 1) % 50 == 0:
             print(f"  captured {input_id + 1}/{len(texts)} ({len(input_ids_kept)} kept)")

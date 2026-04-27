@@ -203,6 +203,7 @@ class ToyTopologicalTransformer(nn.Module):
                 for _ in range(n_layers)
             ]
         )
+        self.final_norm = nn.LayerNorm(d_model)
 
     def reset_parameters_continuous(self, *, seed: int, scale: float = 0.05) -> None:
         """Continuous initialization using normal and Xavier schemes.
@@ -283,8 +284,11 @@ class ToyTopologicalTransformer(nn.Module):
     def forward(self, h: Tensor, *, return_intermediates: bool = False) -> Tensor | tuple[Tensor, list[Tensor]]:
         """Forward pass over (T, d) stream.
 
-        If return_intermediates=True, returns all post-sub-block states in order:
-        [layer0_after_attn, layer0_after_ffn, layer1_after_attn, ...].
+        If return_intermediates=True, returns the final output and a list of
+        intermediate residual states (after each attention and FFN sub-block) in
+        order: [attn0, ffn0, attn1, ffn1, ...]. Input and final norm are NOT
+        included in the intermediates list. This matches the original test
+        convention.
         """
         if h.shape != (self.seq_len, self.d_model):
             raise ValueError(
@@ -302,6 +306,17 @@ class ToyTopologicalTransformer(nn.Module):
             return x, states
         return x
 
+    def forward_with_states(self, h: Tensor) -> list[Tensor]:
+        """Return hidden states at all depths.
+
+        Convenience wrapper matching the LLaMA-style experiment interface.
+        Returns list of length n_depths = 2 * n_layers + 2:
+          [input, post_attn_0, post_ffn_0, post_attn_1, post_ffn_1, ..., post_norm]
+        """
+        final, intermediates = self.forward(h, return_intermediates=True)
+        post_norm = self.final_norm(final)
+        return [h] + intermediates + [post_norm]
+
     def batch_forward(self, h_batch: Tensor) -> Tensor:
         """Batch-friendly forward over shape (B, T, d)."""
         if h_batch.dim() != 3:
@@ -310,6 +325,11 @@ class ToyTopologicalTransformer(nn.Module):
         for i in range(h_batch.shape[0]):
             outputs.append(self.forward(h_batch[i]))
         return torch.stack(outputs, dim=0)
+
+    @property
+    def n_depths(self) -> int:
+        """Total number of depth checkpoints: input + 2 per layer + post-norm."""
+        return 2 * self.n_layers + 2
 
     def subblock_phi(self, layer_idx: int, kind: str) -> Callable[[Tensor], Tensor]:
         """Return phi(h) = h + g(h) for a specific sub-block in one layer."""
@@ -322,6 +342,31 @@ class ToyTopologicalTransformer(nn.Module):
         if kind == "ffn":
             return layer.ffn_phi
         raise ValueError(f"Unknown sub-block kind: {kind}")
+
+    def batch_forward_with_states(self, h_batch: Tensor) -> list[Tensor]:
+        """Return hidden states for a batch of sequences.
+
+        Parameters
+        ----------
+        h_batch : torch.Tensor
+            Shape (B, T, d_model). Each row is an unbatched sequence.
+
+        Returns
+        -------
+        list[torch.Tensor]
+            Length = n_depths. Each tensor has shape (B, T, d_model).
+        """
+        if h_batch.dim() != 3:
+            raise ValueError(f"Expected 3-D input, got shape {tuple(h_batch.shape)}")
+        B = h_batch.shape[0]
+        # Accumulate per-depth lists over the batch
+        depth_lists: list[list[Tensor]] = [[] for _ in range(self.n_depths)]
+        for i in range(B):
+            states = self.forward_with_states(h_batch[i])
+            for d, s in enumerate(states):
+                depth_lists[d].append(s)
+        # Stack along batch dimension
+        return [torch.stack(lst, dim=0) for lst in depth_lists]
 
 
 def full_sequence_jacobian(phi: Callable[[Tensor], Tensor], x: Tensor) -> Tensor:
@@ -422,10 +467,141 @@ def sample_torus(
     return points.to(torch.float32)
 
 
+def sample_sphere(
+    *,
+    n_samples: int,
+    ambient_dim: int = 32,
+    radius: float = 1.0,
+    seed: int = 0,
+) -> Tensor:
+    """Uniformly sample points on the (ambient_dim-1)-sphere via normal projection.
+
+    Ground-truth intrinsic dimension: ambient_dim - 1.
+    """
+    if ambient_dim < 2:
+        raise ValueError("ambient_dim must be >= 2 for a sphere")
+    g = torch.Generator().manual_seed(seed)
+    points = torch.randn(n_samples, ambient_dim, generator=g)
+    points = points / points.norm(dim=1, keepdim=True) * radius
+    return points.to(torch.float32)
+
+
+def sample_hyperplane(
+    *,
+    n_samples: int,
+    ambient_dim: int,
+    manifold_dim: int,
+    seed: int = 0,
+) -> Tensor:
+    """Sample points from a random M-dimensional linear subspace of R^ambient_dim.
+
+    A random orthonormal basis A ∈ R^{ambient_dim×manifold_dim} is drawn once
+    (QR of a Gaussian matrix).  Each token is x = A @ z with z ~ N(0, I_M).
+
+    Ground-truth intrinsic dimension: manifold_dim.
+    """
+    if manifold_dim >= ambient_dim:
+        raise ValueError(f"manifold_dim={manifold_dim} must be < ambient_dim={ambient_dim}")
+    g = torch.Generator().manual_seed(seed)
+    raw = torch.randn(ambient_dim, manifold_dim, generator=g)
+    Q, _ = torch.linalg.qr(raw)
+    basis = Q  # (ambient_dim, manifold_dim), orthonormal columns
+    z = torch.randn(n_samples, manifold_dim, generator=g)
+    points = z @ basis.T
+    # Center to origin (bias-free); standardize scale for numerical stability.
+    points = points - points.mean(dim=0, keepdim=True)
+    points = points / (points.std(dim=0, keepdim=True) + 1e-6)
+    return points.to(torch.float32)
+
+
+def sample_swiss_roll(
+    *,
+    n_samples: int,
+    ambient_dim: int,
+    hole: float = 0.1,
+    seed: int = 0,
+) -> Tensor:
+    """Classic Swiss roll (2D manifold) embedded randomly in R^{ambient_dim}.
+
+    The manifold is first generated in R^3 using the standard parametric
+    equations, then projected to R^{ambient_dim} via a random full-rank linear
+    embedding that is orthonormalized along the projection dimension.
+
+    Ground-truth intrinsic dimension: 2.
+    """
+    if ambient_dim < 3:
+        raise ValueError("ambient_dim must be >= 3 for Swiss roll embedding")
+    g = torch.Generator().manual_seed(seed)
+    # Parametric coordinates in [0, 1]
+    t = 1.5 * torch.pi * (1 + 2 * torch.rand(n_samples, generator=g))
+    # Hole: exclude central region by scaling the radial component
+    scale = 1.0 - hole
+    x = scale * t.cos() * t
+    y = scale * t.sin() * t
+    z = t  # height
+    points_r3 = torch.stack([x, y, z], dim=1)  # (n_samples, 3)
+
+    # Random linear embedding: R^3 → R^ambient_dim
+    embed = torch.randn(3, ambient_dim, generator=g)
+    embed = embed / (embed.norm(dim=0, keepdim=True) + 1e-8)
+    points = points_r3 @ embed
+
+    # Standardize dimension-wise
+    points = (points - points.mean(dim=0, keepdim=True)) / (points.std(dim=0, keepdim=True) + 1e-6)
+    return points.to(torch.float32)
+
+
 def sample_white_noise(*, n_samples: int, ambient_dim: int = 32, seed: int = 0) -> Tensor:
-    """Generate baseline white-noise cloud N(0, I_ambient)."""
+    """Generate baseline white-noise cloud N(0, I_ambient).
+
+    Ground-truth intrinsic dimension: ambient_dim (full ambient space).
+    """
     g = torch.Generator().manual_seed(seed)
     return torch.randn(n_samples, ambient_dim, generator=g, dtype=torch.float32)
+
+
+class HyperplaneSampler:
+    """Stateful sampler for an M-dimensional linear subspace of R^N.
+
+    Mirrors the sampler originally in exp3_llama_hyperplane.py, but now
+    lives in toy_transformer for reuse. Uses the functional ``sample_hyperplane``
+    under the hood.
+
+    Parameters
+    ----------
+    N : int
+        Ambient dimension.
+    M : int
+        Intrinsic manifold dimension (must be < N).
+    seed : int
+        Random seed.
+    device : str
+        Torch device for output tensors.
+    """
+
+    def __init__(self, N: int, M: int, seed: int = 0, device: str = "cpu"):
+        if M >= N:
+            raise ValueError(f"manifold_dim M={M} must be < ambient N={N}")
+        self.N = N
+        self.M = M
+        self.seed = seed
+        self.device = device
+
+    def sample(self, B: int, T: int) -> Tensor:
+        """Return a batch of sequences on the hyperplane.
+
+        Returns
+        -------
+        Tensor
+            Shape (B, T, N) on the requested device.
+        """
+        points = sample_hyperplane(
+            n_samples=B * T,
+            ambient_dim=self.N,
+            manifold_dim=self.M,
+            seed=self.seed,
+        )
+        return points.view(B, T, self.N).to(self.device)
 
 
 def quantize_tensor_symmetric(x: Tensor, *, n_levels: int) -> Tensor:

@@ -43,7 +43,9 @@ from pathlib import Path
 
 import h5py
 import numpy as np
-import skdim
+import torch
+
+from homeomorphism.id_est import EstimatorName, estimate_id as estimate_id_torch
 
 # ---------------------------------------------------------------------------
 # Depth helpers
@@ -71,20 +73,17 @@ def _depth_label(user_depth: int, n_layers: int) -> str:
 
 
 # ---------------------------------------------------------------------------
-# ID estimation
+# ID estimation (shared codebase estimators)
 # ---------------------------------------------------------------------------
 
-_ESTIMATORS: dict[str, skdim.id._BaseEstimator] = {
-    "twonn": skdim.id.TwoNN(),
-    "ess":   skdim.id.ESS(),
-}
+_ESTIMATORS: tuple[EstimatorName, ...] = ("twonn", "ess", "participation_ratio")
 
 
-def estimate_id(cloud: np.ndarray, estimator_name: str) -> float:
-    """Fit the named estimator on cloud (N, d) and return the ID estimate."""
-    est = _ESTIMATORS[estimator_name]
+def estimate_id(cloud: np.ndarray, estimator_name: EstimatorName) -> float:
+    """Run shared project estimator on cloud (N, d) and return the ID estimate."""
     try:
-        return float(est.fit(cloud).dimension_)
+        pts = torch.from_numpy(cloud).to(torch.float32)
+        return float(estimate_id_torch(pts, estimator_name))
     except Exception as e:
         print(f"    [{estimator_name}] failed: {e}")
         return float("nan")
@@ -98,7 +97,7 @@ def run(
     latents_path: Path,
     token_ids: list[int] | None,
     depths: list[int] | None,
-    estimator_names: list[str],
+    estimator_names: list[EstimatorName],
     save_path: Path | None,
 ) -> None:
     rows: list[dict] = []
@@ -196,11 +195,12 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = _build_parser().parse_args()
+    estimator_names: list[EstimatorName] = [e for e in args.estimator]
     run(
         latents_path=args.latents,
         token_ids=args.token,   # None → all tokens resolved inside run()
         depths=args.depth,
-        estimator_names=args.estimator,
+        estimator_names=estimator_names,
         save_path=args.save,
     )
 

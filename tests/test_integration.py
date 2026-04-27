@@ -122,6 +122,11 @@ def test_measure_sublayer_produces_expected_row(gpt2: models.Model) -> None:
         "per_token_sigma_min",
         "per_token_sigma_max",
         "per_token_condition_number",
+        # stability alerts
+        "kappa_alert_threshold",
+        "n_kappa_alert",
+        "kappa_alert_fraction",
+        "n_invalid_condition_number",
         # runtime
         "elapsed_sec",
     }

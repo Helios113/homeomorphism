@@ -61,6 +61,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from homeomorphism.latents import LatentStore, LatentConfig
+
 
 # ---------------------------------------------------------------------------
 # Config
@@ -283,104 +285,7 @@ class HyperplaneSampler:
 # HDF5 latent store
 # ---------------------------------------------------------------------------
 
-_DEPTH_KEY = "depth_{:02d}"
 
-
-class LatentStore:
-    """Append-friendly HDF5 store for hidden states.
-
-    Layout
-    ------
-      /depth_00   float32 (N, T, d_model)   — resizable along axis 0
-      /depth_01   float32 (N, T, d_model)
-      ...
-      /depth_NN   float32 (N, T, d_model)   — after final RMSNorm
-
-    File-level attributes store the config so the file is self-describing.
-
-    Usage
-    -----
-      store = LatentStore.open("latents.h5", cfg)
-      store.append(states)      # list of (B, T, d) tensors, one per depth
-      store.close()
-
-      # or as context manager
-      with LatentStore.open("latents.h5", cfg) as store:
-          store.append(states)
-
-      # reading (no LatentStore needed)
-      with h5py.File("latents.h5", "r") as f:
-          cloud = f["depth_02"][:, 3, :]    # all samples, depth 2, token 3
-          layer = f["depth_00"][:]           # all samples, all tokens, depth 0
-    """
-
-    CHUNK_SAMPLES = 64  # HDF5 chunk size along the sample axis
-
-    def __init__(self, h5file: h5py.File, cfg: Config):
-        self._f = h5file
-        self._cfg = cfg
-
-    @classmethod
-    def open(cls, path: str | Path, cfg: Config) -> "LatentStore":
-        path = Path(path)
-        if path.exists():
-            f = h5py.File(path, "a")
-            stored = json.loads(f.attrs.get("config", "{}"))
-            _check_compatible(stored, cfg)
-        else:
-            f = h5py.File(path, "w")
-            f.attrs["config"] = json.dumps(asdict(cfg))
-            T, d = cfg.seq_len, cfg.d_model
-            chunk = (cls.CHUNK_SAMPLES, T, d)
-            for depth in range(cfg.n_depths):
-                f.create_dataset(
-                    _DEPTH_KEY.format(depth),
-                    shape=(0, T, d),
-                    maxshape=(None, T, d),
-                    dtype="float32",
-                    chunks=chunk,
-                    compression="lzf",
-                )
-        return cls(f, cfg)
-
-    def append(self, states: list[torch.Tensor]) -> None:
-        """Append one batch of hidden states.
-
-        states: list of length n_depths, each tensor (B, T, d_model).
-        """
-        if len(states) != self._cfg.n_depths:
-            raise ValueError(
-                f"expected {self._cfg.n_depths} depth tensors, got {len(states)}"
-            )
-        for depth, h in enumerate(states):
-            arr = h.detach().cpu().float().numpy()   # (B, T, d)
-            ds = self._f[_DEPTH_KEY.format(depth)]
-            old_n = ds.shape[0]
-            ds.resize(old_n + arr.shape[0], axis=0)
-            ds[old_n:] = arr
-
-    def n_samples(self) -> int:
-        return self._f[_DEPTH_KEY.format(0)].shape[0]
-
-    def close(self) -> None:
-        self._f.close()
-
-    def __enter__(self) -> "LatentStore":
-        return self
-
-    def __exit__(self, *_) -> None:
-        self.close()
-
-
-def _check_compatible(stored: dict, cfg: Config) -> None:
-    """Raise if the on-disk config is incompatible with the current cfg."""
-    for key in ("d_model", "seq_len", "n_layers"):
-        s, c = stored.get(key), getattr(cfg, key, None)
-        if s is not None and s != c:
-            raise ValueError(
-                f"File was created with {key}={s}; current config has {key}={c}. "
-                "Use a different output file or match the config."
-            )
 
 
 # ---------------------------------------------------------------------------
@@ -451,7 +356,8 @@ def run(cfg: Config, n_samples: int, batch_size: int, save_path: Path | None) ->
 
     if save_path is not None:
         print(f"Saving: {save_path}  ({n_samples} samples, batch={batch_size})")
-        with LatentStore.open(save_path, cfg) as store:
+        latent_cfg = LatentConfig.from_exp3_config(cfg)
+        with LatentStore.open(save_path, latent_cfg) as store:
             collect_latents(model, sampler, n_samples, batch_size, store=store)
             final_n = store.n_samples()
         print(f"Done.  {final_n} total samples in {save_path}")

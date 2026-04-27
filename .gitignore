@@ -31,3 +31,4 @@ results/
 # Local runtime artifacts
 .cache/
 tmp/
+.kilo/plans/1777230015836-clever-rocket.md
