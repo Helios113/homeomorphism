@@ -12,8 +12,10 @@ Baseline Groups
 ---------------
   groupA: trained, topological_initialisation, maximum_entropy_injection
       (requires trained weights → only runs for gpt2)
+      Estimators: twonn, ess
   groupB: syntactic_disintegration, semantic_scrambling
       (works for any model; uses same weight mode as model default)
+      Estimators: twonn, ess, participation_ratio
 
 Output
 -------
