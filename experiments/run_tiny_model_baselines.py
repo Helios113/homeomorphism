@@ -42,8 +42,8 @@ ALL_MODELS = [
     "tiny-gpt2-8l-256d",
 ]
 
-# Baseline group definitions
-BASELINE_GROUPS = {
+# Baseline group definitions (default values, can be overridden via CLI)
+DEFAULT_BASELINE_GROUPS = {
     "groupA": {
         "baselines": "trained,topological_initialisation,maximum_entropy_injection",
         "n_samples": 256,
@@ -106,13 +106,14 @@ def _run(cmd: list[str], quiet: bool = False) -> None:
 def run_baseline_for_model(
     model_name: str,
     group_key: str,
+    baseline_groups: dict,
     output_root: Path,
     seed: int,
     device: str,
     corpus: str,
     quick: bool = False,
 ) -> None:
-    group_cfg = BASELINE_GROUPS[group_key]
+    group_cfg = baseline_groups[group_key]
     weight_mode = _weight_mode_for_model(model_name)
 
     ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
@@ -153,6 +154,10 @@ def main() -> None:
                    help="Baseline groups to run: groupA,groupB (default: both)")
     p.add_argument("--output-root", type=Path, default=Path("results/baselines"),
                    help="Base output directory (default: results/baselines)")
+    p.add_argument("--n-samples", type=int, default=None,
+                   help="Number of samples per baseline (default: 256)")
+    p.add_argument("--max-tokens", type=int, default=None,
+                   help="Maximum tokens per sequence (default: 64)")
     p.add_argument("--seed", type=int, default=DEFAULT_SEED)
     p.add_argument("--device", default=DEVICE)
     p.add_argument("--corpus", default=DEFAULT_CORPUS)
@@ -164,6 +169,15 @@ def main() -> None:
         import torch
         if not torch.cuda.is_available():
             raise RuntimeError("CUDA requested but not available")
+
+    # Build baseline groups with CLI overrides
+    BASELINE_GROUPS = {}
+    for group_key, defaults in DEFAULT_BASELINE_GROUPS.items():
+        BASELINE_GROUPS[group_key] = defaults.copy()
+        if args.n_samples is not None:
+            BASELINE_GROUPS[group_key]["n_samples"] = args.n_samples
+        if args.max_tokens is not None:
+            BASELINE_GROUPS[group_key]["max_tokens"] = args.max_tokens
 
     models = args.models.split(",") if args.models else ALL_MODELS
     groups = args.groups.split(",") if args.groups else ["groupA", "groupB"]
@@ -202,6 +216,7 @@ def main() -> None:
                 run_baseline_for_model(
                     model_name=model_name,
                     group_key=group_key,
+                    baseline_groups=BASELINE_GROUPS,
                     output_root=args.output_root,
                     seed=args.seed,
                     device=args.device,
