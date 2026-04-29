@@ -25,6 +25,7 @@ from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
     GPT2Config,
+    LlamaConfig,
     PreTrainedModel,
     PreTrainedTokenizer,
 )
@@ -41,6 +42,14 @@ WeightsMode = Literal["trained", "random_gaussian", "random_kaiming"]
 #   nano-gpt2-4l-128d  -> 4 layers, 128 hidden dim
 _CUSTOM_MODEL_RE = re.compile(
     r"^(?P<prefix>tiny|micro|nano)-gpt2-(?P<layers>\d+)l-(?P<hidden>\d+)d$"
+)
+# Custom LLaMA pattern: llama-{L}l-{N}d-{M}m  (L = layers, N = d_model, M = manifold_dim)
+_CUSTOM_LLAMA_RE = re.compile(
+    r"^llama-(?P<layers>\d+)l-(?P<hidden>\d+)d-(?P<manifold>\d+)m$"
+)
+# Custom LLaMA pattern: llama-{L}l-{N}d-{M}m
+_CUSTOM_LLAMA_RE = re.compile(
+    r"^llama-(?P<layers>\d+)l-(?P<hidden>\d+)d-(?P<manifold>\d+)m$"
 )
 
 
@@ -90,11 +99,14 @@ ARCH_SPECS: dict[str, ArchSpec] = {
         ffn_norm="ln_2",
         ffn_module="mlp",
     ),
-    # Future:
-    # "llama": ArchSpec("llama", "model.layers.{n}", "input_layernorm", "self_attn",
-    #                   "post_attention_layernorm", "mlp"),
-    # "pythia": ArchSpec("pythia", "gpt_neox.layers.{n}", "input_layernorm", "attention",
-    #                    "post_attention_layernorm", "mlp"),
+    "llama": ArchSpec(
+        family="llama",
+        blocks_template="model.layers.{n}",
+        attn_norm="input_layernorm",
+        attn_module="self_attn",
+        ffn_norm="post_attention_layernorm",
+        ffn_module="mlp",
+    ),
 }
 
 
@@ -104,6 +116,8 @@ def _detect_arch(model_name: str) -> str:
         return "gpt2"
     if _CUSTOM_MODEL_RE.match(n):
         return "gpt2"
+    if _CUSTOM_LLAMA_RE.match(n):
+        return "llama"
     raise ValueError(
         f"No ArchSpec registered for model_name={model_name!r}. "
         f"Extend ARCH_SPECS and _PHI_BUILDERS."
@@ -141,9 +155,44 @@ def _make_gpt2_ffn_phi(block: nn.Module) -> Callable[[torch.Tensor], torch.Tenso
     return phi
 
 
+def _make_llama_attn_phi(block: nn.Module) -> Callable[[torch.Tensor], torch.Tensor]:
+    """phi(h) = h + block.self_attn(block.input_layernorm(h)) for a LLaMA decoder layer."""
+
+    def phi(h: torch.Tensor, **kwargs: Any) -> torch.Tensor:
+        h3 = h.unsqueeze(0)  # (1, T, d)
+        normed = block.input_layernorm(h3)
+        # Generate position_ids for the sequence length
+        T = h3.shape[1]
+        position_ids = torch.arange(T, device=h3.device).unsqueeze(0)  # (1, T)
+        # Compute rotary position embeddings using the attached rotary_emb
+        # (attached in load_model for LLaMA models)
+        rotary = block.rotary_emb
+        cos, sin = rotary(normed, position_ids=position_ids)
+        attn_out = block.self_attn(normed, position_embeddings=(cos, sin))
+        if isinstance(attn_out, tuple):
+            attn_out = attn_out[0]
+        return (h3 + attn_out).squeeze(0)
+
+    return phi
+
+
+def _make_llama_ffn_phi(block: nn.Module) -> Callable[[torch.Tensor], torch.Tensor]:
+    """phi(h) = h + block.mlp(block.post_attention_layernorm(h)) for a LLaMA decoder layer."""
+
+    def phi(h: torch.Tensor, **kwargs: Any) -> torch.Tensor:
+        h3 = h.unsqueeze(0)
+        normed = block.post_attention_layernorm(h3)
+        ffn_out = block.mlp(normed)
+        return (h3 + ffn_out).squeeze(0)
+
+    return phi
+
+
 _PHI_BUILDERS: dict[tuple[str, SublayerKind], Callable[[nn.Module], Callable]] = {
     ("gpt2", "attn"): _make_gpt2_attn_phi,
     ("gpt2", "ffn"): _make_gpt2_ffn_phi,
+    ("llama", "attn"): _make_llama_attn_phi,
+    ("llama", "ffn"): _make_llama_ffn_phi,
 }
 
 # ---------------------------------------------------------------------------
@@ -179,6 +228,47 @@ def _build_custom_gpt2_config(model_name: str) -> GPT2Config:
         bos_token_id=50256,
         eos_token_id=50256,
         pad_token_id=50256,  # will be overridden later
+    )
+    return cfg
+
+
+def _build_custom_llama_config(model_name: str) -> LlamaConfig:
+    """Parse llama-{L}l-{N}d-{M}m names and return a LlamaConfig."""
+    m = _CUSTOM_LLAMA_RE.match(model_name)
+    if m is None:
+        raise ValueError(f"custom llama model name does not match pattern: {model_name!r}")
+    n_layers = int(m.group("layers"))
+    d_model = int(m.group("hidden"))
+    # manifold_dim = int(m.group("manifold"))  # not used in model architecture
+
+    # Choose num_attention_heads to ensure even head_dim for RoPE compatibility.
+    # RoPE assumes head_dim is even. Strategy: prefer 4 heads if d_model divisible by 8
+    # (=> head_dim = d_model/4 is even). Otherwise use 2 heads (=> head_dim = d_model/2,
+    # which is even if d_model divisible by 4). For other cases, fall back to 2 or 1.
+    n_heads = None
+    for h in (4, 2):
+        if d_model % h == 0:
+            head_dim = d_model // h
+            if head_dim % 2 == 0:
+                n_heads = h
+                break
+    if n_heads is None:
+        # Last resort: use 2 heads if d_model even, else 1 head (may cause RoPE issues)
+        n_heads = 2 if d_model % 2 == 0 else 1
+
+    cfg = LlamaConfig(
+        hidden_size=d_model,
+        num_hidden_layers=n_layers,
+        num_attention_heads=n_heads,
+        intermediate_size=4 * d_model,
+        hidden_act="silu",
+        max_position_embeddings=2048,
+        rms_norm_eps=1e-6,
+        rope_theta=10000.0,
+        vocab_size=50257,  # align with GPT2 tokenizer used for custom models
+        bos_token_id=1,
+        eos_token_id=2,
+        pad_token_id=0,
     )
     return cfg
 
@@ -219,7 +309,7 @@ def load_model(
     """
     cache_dir = str(hf_cache_dir())
     arch = _detect_arch(name)
-    is_custom = _CUSTOM_MODEL_RE.match(name) is not None
+    is_custom = (_CUSTOM_MODEL_RE.match(name) is not None) or (_CUSTOM_LLAMA_RE.match(name) is not None)
 
     # Tokenizer: custom models reuse GPT-2 tokenizer
     tokenizer = AutoTokenizer.from_pretrained(
@@ -232,7 +322,10 @@ def load_model(
                 f"custom model {name!r} does not support weights='trained'; "
                 f"use 'random_gaussian' or 'random_kaiming'"
             )
-        cfg = _build_custom_gpt2_config(name)
+        if _CUSTOM_MODEL_RE.match(name):
+            cfg = _build_custom_gpt2_config(name)
+        else:  # _CUSTOM_LLAMA_RE.match(name)
+            cfg = _build_custom_llama_config(name)
         model = AutoModelForCausalLM.from_config(cfg)
     else:
         model = AutoModelForCausalLM.from_pretrained(
@@ -258,6 +351,13 @@ def load_model(
         raise ValueError(f"Unknown weights mode: {weights!r}")
 
     model = model.to(device).eval()
+
+    # Attach rotary_emb to each decoder layer for LLaMA models (needed for phi construction)
+    if arch == "llama":
+        # model.model is the LlamaModel; its layers is a ModuleList of LlamaDecoderLayer
+        # and it has a rotary_emb attribute. We attach a reference to each layer for phi use.
+        for layer in model.model.layers:
+            layer.rotary_emb = model.model.rotary_emb
 
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token

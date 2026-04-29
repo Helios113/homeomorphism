@@ -108,22 +108,32 @@ def _append_latent_sample(group: h5py.Group, depth: int, sample: torch.Tensor) -
 
 def _model_input_stream(m: models.Model, forward_kwargs: dict[str, torch.Tensor]) -> torch.Tensor:
     """Return the residual stream entering block 0, shape (T, d)."""
-    if m.arch != "gpt2":
+    if m.arch == "gpt2":
+        if "inputs_embeds" in forward_kwargs:
+            x = forward_kwargs["inputs_embeds"]
+        else:
+            input_ids = forward_kwargs["input_ids"]
+            x = m.model.transformer.wte(input_ids)
+
+        position_ids = forward_kwargs.get("position_ids")
+        if position_ids is None:
+            raise ValueError("prepared input is missing position_ids")
+
+        pos = m.model.transformer.wpe(position_ids)
+        x = x + pos
+        x = m.model.transformer.drop(x)
+    elif m.arch == "llama":
+        if "inputs_embeds" in forward_kwargs:
+            x = forward_kwargs["inputs_embeds"]
+        else:
+            input_ids = forward_kwargs["input_ids"]
+            # LLaMAForCausalLM stores the base model in .model; embed_tokens there
+            x = m.model.model.embed_tokens(input_ids)
+        # No separate position embeddings; RoPE applied inside attention
+        # No additional dropout needed (model.eval() disables dropout)
+    else:
         raise NotImplementedError(f"input-stream capture not registered for arch {m.arch!r}")
 
-    if "inputs_embeds" in forward_kwargs:
-        x = forward_kwargs["inputs_embeds"]
-    else:
-        input_ids = forward_kwargs["input_ids"]
-        x = m.model.transformer.wte(input_ids)
-
-    position_ids = forward_kwargs.get("position_ids")
-    if position_ids is None:
-        raise ValueError("prepared input is missing position_ids")
-
-    pos = m.model.transformer.wpe(position_ids)
-    x = x + pos
-    x = m.model.transformer.drop(x)
     if x.shape[0] != 1:
         raise ValueError(f"expected batch size 1, got {x.shape[0]}")
     return x[0].detach().to(torch.float32).cpu()
@@ -272,6 +282,8 @@ def sublayer_depths(sublayers: list[tuple[int, SublayerKind]]) -> list[int]:
 def _final_norm_path(m: models.Model) -> str:
     if m.arch == "gpt2":
         return "transformer.ln_f"
+    elif m.arch == "llama":
+        return "model.norm"
     raise NotImplementedError(f"final norm path not registered for arch {m.arch!r}")
 
 

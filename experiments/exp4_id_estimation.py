@@ -54,7 +54,11 @@ from homeomorphism.id_est import EstimatorName, estimate_id as estimate_id_torch
 def _n_all_depths(h5: h5py.File) -> int:
     """Total user-visible depths = 2 * n_layers + 2 (input + blocks + post-norm)."""
     cfg = json.loads(h5.attrs["config"])
-    return 2 * cfg["n_layers"] + 2
+    # Try config JSON first (synthetic experiments), then individual attrs (baseline experiments)
+    n_layers = cfg.get("n_layers") or h5.attrs.get("n_layers")
+    if n_layers is None:
+        raise KeyError("n_layers not found in config or attributes")
+    return 2 * int(n_layers) + 2
 
 
 def _hdf5_key(user_depth: int) -> str:

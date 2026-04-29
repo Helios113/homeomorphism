@@ -294,7 +294,17 @@ def build_llama_model(
     device: str = "cpu",
 ) -> tuple[LlamaHyperplane, LlamaConfig]:
     if n_heads is None:
-        n_heads = 4
+        # Auto-select heads to ensure even head_dim for RoPE compatibility
+        n_heads_candidate = None
+        for h in (4, 2):
+            if d_model % h == 0:
+                head_dim = d_model // h
+                if head_dim % 2 == 0:
+                    n_heads_candidate = h
+                    break
+        if n_heads_candidate is None:
+            n_heads_candidate = 2 if d_model % 2 == 0 else 1
+        n_heads = n_heads_candidate
     if d_ff is None:
         d_ff = 4 * d_model
     cfg = LlamaConfig(

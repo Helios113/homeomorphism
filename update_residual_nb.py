@@ -1,21 +1,9 @@
-{
- "cells": [
-  {
-   "cell_type": "markdown",
-   "id": "dfa37246",
-   "metadata": {},
-   "source": [
-    "# Sanity 2: Residual ReLU Block (Analytical vs Numerical)\n",
-    "Compares analytic determinant and condition number against autograd Jacobian extraction."
-   ]
-  },
-  {
-   "cell_type": "code",
-   "execution_count": null,
-   "id": "3aee8245",
-   "metadata": {},
-   "outputs": [],
-   "source": [
+import json
+
+with open("notebooks/baseline_notebook/residual_relu_analytic_jacobian.ipynb", "r") as f:
+    nb = json.load(f)
+
+new_source = [
     "import torch\n",
     "import matplotlib.pyplot as plt\n",
     "from homeomorphism import jacobian\n",
@@ -89,14 +77,9 @@
     "\n",
     "plt.tight_layout()\n",
     "plt.show()\n"
-   ]
-  }
- ],
- "metadata": {
-  "language_info": {
-   "name": "python"
-  }
- },
- "nbformat": 4,
- "nbformat_minor": 5
-}
+]
+
+nb["cells"][1]["source"] = new_source
+
+with open("notebooks/baseline_notebook/residual_relu_analytic_jacobian.ipynb", "w") as f:
+    json.dump(nb, f, indent=1)
