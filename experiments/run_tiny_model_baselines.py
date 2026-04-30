@@ -22,6 +22,9 @@ Output
   results/baselines/{group}/{model_name}/{timestamp}/
 """
 
+.. deprecated:: 2025-04
+    This script is deprecated. Use :mod:`experiments.baseline_runner` instead:
+        python experiments/baseline_runner.py --models gpt2 tiny-gpt2-4l-256d --baseline-group groupA
 from __future__ import annotations
 
 import argparse

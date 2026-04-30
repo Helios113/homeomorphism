@@ -188,24 +188,27 @@ class LlamaHyperplane(nn.Module):
 # ============================================================================
 
 class SphereSampler:
-    def __init__(self, ambient_dim: int, radius: float, seed: int):
+    def __init__(self, ambient_dim: int, radius: float, seed: int = 0):
         self.ambient_dim = ambient_dim
         self.radius = radius
         self.seed = seed
+        self.generator = torch.Generator().manual_seed(seed)  # persistent generator
+
     def sample(self, B: int, T: int) -> torch.Tensor:
         total = B * T
-        g = torch.Generator().manual_seed(self.seed)
-        x = torch.randn(total, self.ambient_dim, generator=g)
+        x = torch.randn(total, self.ambient_dim, generator=self.generator)
         x = x / x.norm(dim=1, keepdim=True) * self.radius
         return x  # (B*T, d)
 
 class TorusSampler:
-    def __init__(self, ambient_dim: int, seed: int):
+    def __init__(self, ambient_dim: int, seed: int = 0):
         self.ambient_dim = ambient_dim
         self.seed = seed
+        self.generator = torch.Generator().manual_seed(seed)  # persistent
+
     def sample(self, B: int, T: int) -> torch.Tensor:
         total = B * T
-        g = torch.Generator().manual_seed(self.seed)
+        g = self.generator
         theta = 2.0 * torch.pi * torch.rand(total, generator=g)
         phi = 2.0 * torch.pi * torch.rand(total, generator=g)
         major, minor = 2.0, 0.7
@@ -224,9 +227,11 @@ class SwissRollSampler:
         self.ambient_dim = ambient_dim
         self.hole = hole
         self.seed = seed
+        self.generator = torch.Generator().manual_seed(seed)  # persistent
+
     def sample(self, B: int, T: int) -> torch.Tensor:
         total = B * T
-        g = torch.Generator().manual_seed(self.seed)
+        g = self.generator
         t = 1.5 * torch.pi * (1 + 2 * torch.rand(total, generator=g))
         scale = 1.0 - self.hole
         x = scale * t.cos() * t
@@ -240,13 +245,14 @@ class SwissRollSampler:
         return pts
 
 class WhiteNoiseSampler:
-    def __init__(self, ambient_dim: int, seed: int):
+    def __init__(self, ambient_dim: int, seed: int = 0):
         self.ambient_dim = ambient_dim
         self.seed = seed
+        self.generator = torch.Generator().manual_seed(seed)  # persistent
+
     def sample(self, B: int, T: int) -> torch.Tensor:
         total = B * T
-        g = torch.Generator().manual_seed(self.seed)
-        return torch.randn(total, self.ambient_dim, generator=g)
+        return torch.randn(total, self.ambient_dim, generator=self.generator)
 
 # ============================================================================
 # Model builders

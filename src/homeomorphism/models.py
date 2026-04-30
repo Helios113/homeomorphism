@@ -25,9 +25,11 @@ from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
     GPT2Config,
+    GPTNeoXConfig,
     LlamaConfig,
     PreTrainedModel,
     PreTrainedTokenizer,
+    Qwen2Config,
 )
 
 from .paths import hf_cache_dir
@@ -47,10 +49,25 @@ _CUSTOM_MODEL_RE = re.compile(
 _CUSTOM_LLAMA_RE = re.compile(
     r"^llama-(?P<layers>\d+)l-(?P<hidden>\d+)d-(?P<manifold>\d+)m$"
 )
-# Custom LLaMA pattern: llama-{L}l-{N}d-{M}m
-_CUSTOM_LLAMA_RE = re.compile(
-    r"^llama-(?P<layers>\d+)l-(?P<hidden>\d+)d-(?P<manifold>\d+)m$"
+# Custom Qwen pattern: qwen-{L}l-{N}d
+_CUSTOM_QWEN_RE = re.compile(
+    r"^qwen-(?P<layers>\d+)l-(?P<hidden>\d+)d$"
 )
+# Custom Pythia pattern: pythia-{L}l-{N}d
+_CUSTOM_PYTHIA_RE = re.compile(
+    r"^pythia-(?P<layers>\d+)l-(?P<hidden>\d+)d$"
+)
+
+
+def _select_num_heads(hidden_size: int, preferred: tuple[int, ...] = (8, 4, 2, 1)) -> int:
+    """Pick a head count whose head dimension is even."""
+    for num_heads in preferred:
+        if hidden_size % num_heads == 0 and (hidden_size // num_heads) % 2 == 0:
+            return num_heads
+    for num_heads in range(min(hidden_size, 32), 0, -1):
+        if hidden_size % num_heads == 0 and (hidden_size // num_heads) % 2 == 0:
+            return num_heads
+    raise ValueError(f"cannot choose an even head dimension for hidden_size={hidden_size}")
 
 
 # ---------------------------------------------------------------------------
@@ -107,6 +124,22 @@ ARCH_SPECS: dict[str, ArchSpec] = {
         ffn_norm="post_attention_layernorm",
         ffn_module="mlp",
     ),
+    "qwen": ArchSpec(
+        family="qwen",
+        blocks_template="model.layers.{n}",
+        attn_norm="input_layernorm",
+        attn_module="self_attn",
+        ffn_norm="post_attention_layernorm",
+        ffn_module="mlp",
+    ),
+    "pythia": ArchSpec(
+        family="pythia",
+        blocks_template="gpt_neox.layers.{n}",
+        attn_norm="input_layernorm",
+        attn_module="attention",
+        ffn_norm="post_attention_layernorm",
+        ffn_module="mlp",
+    ),
 }
 
 
@@ -118,6 +151,10 @@ def _detect_arch(model_name: str) -> str:
         return "gpt2"
     if _CUSTOM_LLAMA_RE.match(n):
         return "llama"
+    if "qwen" in n:
+        return "qwen"
+    if _CUSTOM_PYTHIA_RE.match(n):
+        return "pythia"
     raise ValueError(
         f"No ArchSpec registered for model_name={model_name!r}. "
         f"Extend ARCH_SPECS and _PHI_BUILDERS."
@@ -188,11 +225,48 @@ def _make_llama_ffn_phi(block: nn.Module) -> Callable[[torch.Tensor], torch.Tens
     return phi
 
 
+def _make_rotary_attn_phi(block: nn.Module, *, attn_module_name: str) -> Callable[[torch.Tensor], torch.Tensor]:
+    """phi(h) = h + attention(norm(h)) for RoPE-based decoder layers."""
+
+    def phi(h: torch.Tensor, **kwargs: Any) -> torch.Tensor:
+        h3 = h.unsqueeze(0)
+        normed = block.input_layernorm(h3)
+        position_ids = torch.arange(h3.shape[1], device=h3.device).unsqueeze(0)
+        cos, sin = block.rotary_emb(normed, position_ids=position_ids)
+        attn_module = getattr(block, attn_module_name)
+        attn_out = attn_module(
+            normed,
+            attention_mask=None,
+            position_embeddings=(cos, sin),
+        )
+        if isinstance(attn_out, tuple):
+            attn_out = attn_out[0]
+        return (h3 + attn_out).squeeze(0)
+
+    return phi
+
+
+def _make_rotary_ffn_phi(block: nn.Module) -> Callable[[torch.Tensor], torch.Tensor]:
+    """phi(h) = h + block.mlp(block.post_attention_layernorm(h)) for RoPE families."""
+
+    def phi(h: torch.Tensor, **kwargs: Any) -> torch.Tensor:
+        h3 = h.unsqueeze(0)
+        normed = block.post_attention_layernorm(h3)
+        ffn_out = block.mlp(normed)
+        return (h3 + ffn_out).squeeze(0)
+
+    return phi
+
+
 _PHI_BUILDERS: dict[tuple[str, SublayerKind], Callable[[nn.Module], Callable]] = {
     ("gpt2", "attn"): _make_gpt2_attn_phi,
     ("gpt2", "ffn"): _make_gpt2_ffn_phi,
     ("llama", "attn"): _make_llama_attn_phi,
     ("llama", "ffn"): _make_llama_ffn_phi,
+    ("qwen", "attn"): lambda block: _make_rotary_attn_phi(block, attn_module_name="self_attn"),
+    ("qwen", "ffn"): _make_rotary_ffn_phi,
+    ("pythia", "attn"): lambda block: _make_rotary_attn_phi(block, attn_module_name="attention"),
+    ("pythia", "ffn"): _make_rotary_ffn_phi,
 }
 
 # ---------------------------------------------------------------------------
@@ -273,6 +347,53 @@ def _build_custom_llama_config(model_name: str) -> LlamaConfig:
     return cfg
 
 
+def _build_custom_qwen_config(model_name: str) -> Qwen2Config:
+    """Parse qwen-{L}l-{N}d names and return a Qwen2Config."""
+    m = _CUSTOM_QWEN_RE.match(model_name)
+    if m is None:
+        raise ValueError(f"custom qwen model name does not match pattern: {model_name!r}")
+    n_layers = int(m.group("layers"))
+    d_model = int(m.group("hidden"))
+    n_heads = _select_num_heads(d_model)
+    n_kv_heads = max(1, n_heads // 2)
+    return Qwen2Config(
+        hidden_size=d_model,
+        intermediate_size=4 * d_model,
+        num_hidden_layers=n_layers,
+        num_attention_heads=n_heads,
+        num_key_value_heads=n_kv_heads,
+        max_position_embeddings=2048,
+        rms_norm_eps=1e-6,
+        rope_theta=10000.0,
+        vocab_size=50257,
+        bos_token_id=1,
+        eos_token_id=2,
+        pad_token_id=0,
+    )
+
+
+def _build_custom_pythia_config(model_name: str) -> GPTNeoXConfig:
+    """Parse pythia-{L}l-{N}d names and return a GPTNeoXConfig."""
+    m = _CUSTOM_PYTHIA_RE.match(model_name)
+    if m is None:
+        raise ValueError(f"custom pythia model name does not match pattern: {model_name!r}")
+    n_layers = int(m.group("layers"))
+    d_model = int(m.group("hidden"))
+    n_heads = _select_num_heads(d_model)
+    return GPTNeoXConfig(
+        hidden_size=d_model,
+        intermediate_size=4 * d_model,
+        num_hidden_layers=n_layers,
+        num_attention_heads=n_heads,
+        max_position_embeddings=2048,
+        rotary_pct=1.0,
+        vocab_size=50257,
+        bos_token_id=0,
+        eos_token_id=1,
+        pad_token_id=0,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Loader
 # ---------------------------------------------------------------------------
@@ -309,7 +430,12 @@ def load_model(
     """
     cache_dir = str(hf_cache_dir())
     arch = _detect_arch(name)
-    is_custom = (_CUSTOM_MODEL_RE.match(name) is not None) or (_CUSTOM_LLAMA_RE.match(name) is not None)
+    is_custom = (
+        (_CUSTOM_MODEL_RE.match(name) is not None)
+        or (_CUSTOM_LLAMA_RE.match(name) is not None)
+        or (_CUSTOM_QWEN_RE.match(name) is not None)
+        or (_CUSTOM_PYTHIA_RE.match(name) is not None)
+    )
 
     # Tokenizer: custom models reuse GPT-2 tokenizer
     tokenizer = AutoTokenizer.from_pretrained(
@@ -324,8 +450,12 @@ def load_model(
             )
         if _CUSTOM_MODEL_RE.match(name):
             cfg = _build_custom_gpt2_config(name)
-        else:  # _CUSTOM_LLAMA_RE.match(name)
+        elif _CUSTOM_LLAMA_RE.match(name):
             cfg = _build_custom_llama_config(name)
+        elif _CUSTOM_QWEN_RE.match(name):
+            cfg = _build_custom_qwen_config(name)
+        else:
+            cfg = _build_custom_pythia_config(name)
         model = AutoModelForCausalLM.from_config(cfg)
     else:
         model = AutoModelForCausalLM.from_pretrained(
@@ -352,12 +482,23 @@ def load_model(
 
     model = model.to(device).eval()
 
-    # Attach rotary_emb to each decoder layer for LLaMA models (needed for phi construction)
-    if arch == "llama":
-        # model.model is the LlamaModel; its layers is a ModuleList of LlamaDecoderLayer
-        # and it has a rotary_emb attribute. We attach a reference to each layer for phi use.
+    # Ensure rotary_emb exists for RoPE-based families.
+    if arch == "qwen" and not hasattr(model.model, 'rotary_emb'):
+        from transformers.models.qwen2.modeling_qwen2 import Qwen2RotaryEmbedding
+        config = model.model.config
+        model.model.rotary_emb = Qwen2RotaryEmbedding(
+            config.hidden_size // config.num_attention_heads,
+            config.max_position_embeddings,
+            config.rope_theta,
+        )
+
+    # Attach rotary_emb to each decoder layer for RoPE-based families.
+    if arch in {"llama", "qwen"}:
         for layer in model.model.layers:
             layer.rotary_emb = model.model.rotary_emb
+    elif arch == "pythia":
+        for layer in model.gpt_neox.layers:
+            layer.rotary_emb = model.gpt_neox.rotary_emb
 
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token

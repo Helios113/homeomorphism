@@ -48,6 +48,8 @@ STANDARD_MODELS = [
 LLAMA_MODELS = [
     "llama-2l-20d-10m",    # Custom LLaMA-2L, ~1GB
     "llama-4l-32d-16m",    # Custom LLaMA-4L, ~2GB
+    "pythia-2l-20d",       # Custom Pythia-2L, ~1GB
+    "qwen-2l-20d",         # Custom Qwen-2L, ~1GB
 ]
 
 ALL_MODELS = TINY_MODELS + STANDARD_MODELS + LLAMA_MODELS
@@ -91,6 +93,8 @@ SYNTHETIC_MODELS = [
     "toy-2l-32d",          # Very small toy model
     "toy-4l-64d",          # Small toy model
     "llama-2l-20d-10m",    # Small LLaMA model
+    "pythia-2l-20d",       # Small Pythia model
+    "qwen-2l-20d",         # Small Qwen model
 ]
 
 # ============================================================================

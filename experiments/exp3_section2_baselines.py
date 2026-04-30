@@ -12,6 +12,14 @@ Outputs (project-local):
     overlap.jsonl
 """
 
+.. deprecated:: 2025-04
+    This script is deprecated. Please use :mod:`experiments.baseline_runner` instead,
+    which provides a unified, modular interface for baseline experiments.
+
+    For backward compatibility, this script is still available, but new code should use:
+        python experiments/baseline_runner.py --model gpt2 --baseline-group groupA
+    instead of:
+        python experiments/exp3_section2_baselines.py --model gpt2 --baselines ...
 from __future__ import annotations
 
 import argparse

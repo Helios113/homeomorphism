@@ -442,14 +442,16 @@ def sample_torus(
     major_radius: float = 2.0,
     minor_radius: float = 0.7,
     seed: int = 0,
+    generator: torch.Generator | None = None,
 ) -> Tensor:
     """Sample points from a torus and embed smoothly into R^{ambient_dim}."""
     if ambient_dim < 3:
         raise ValueError("ambient_dim must be >= 3")
 
-    g = torch.Generator().manual_seed(seed)
-    theta = 2.0 * torch.pi * torch.rand(n_samples, generator=g)
-    phi = 2.0 * torch.pi * torch.rand(n_samples, generator=g)
+    if generator is None:
+        generator = torch.Generator().manual_seed(seed)
+    theta = 2.0 * torch.pi * torch.rand(n_samples, generator=generator)
+    phi = 2.0 * torch.pi * torch.rand(n_samples, generator=generator)
 
     x = (major_radius + minor_radius * torch.cos(phi)) * torch.cos(theta)
     y = (major_radius + minor_radius * torch.cos(phi)) * torch.sin(theta)
@@ -458,7 +460,7 @@ def sample_torus(
 
     # Random full-rank linear embedding from R^3 -> R^ambient_dim.
     # Avoid reduced QR here because a 3xambient matrix would reduce back to 3x3.
-    embed = torch.randn(3, ambient_dim, generator=g)
+    embed = torch.randn(3, ambient_dim, generator=generator)
     embed = embed / (embed.norm(dim=0, keepdim=True) + 1e-8)
     points = torus_r3 @ embed
 
@@ -473,6 +475,7 @@ def sample_sphere(
     ambient_dim: int = 32,
     radius: float = 1.0,
     seed: int = 0,
+    generator: torch.Generator | None = None,
 ) -> Tensor:
     """Uniformly sample points on the (ambient_dim-1)-sphere via normal projection.
 
@@ -480,8 +483,9 @@ def sample_sphere(
     """
     if ambient_dim < 2:
         raise ValueError("ambient_dim must be >= 2 for a sphere")
-    g = torch.Generator().manual_seed(seed)
-    points = torch.randn(n_samples, ambient_dim, generator=g)
+    if generator is None:
+        generator = torch.Generator().manual_seed(seed)
+    points = torch.randn(n_samples, ambient_dim, generator=generator)
     points = points / points.norm(dim=1, keepdim=True) * radius
     return points.to(torch.float32)
 
@@ -492,6 +496,7 @@ def sample_hyperplane(
     ambient_dim: int,
     manifold_dim: int,
     seed: int = 0,
+    generator: torch.Generator | None = None,
 ) -> Tensor:
     """Sample points from a random M-dimensional linear subspace of R^ambient_dim.
 
@@ -502,11 +507,12 @@ def sample_hyperplane(
     """
     if manifold_dim >= ambient_dim:
         raise ValueError(f"manifold_dim={manifold_dim} must be < ambient_dim={ambient_dim}")
-    g = torch.Generator().manual_seed(seed)
-    raw = torch.randn(ambient_dim, manifold_dim, generator=g)
+    if generator is None:
+        generator = torch.Generator().manual_seed(seed)
+    raw = torch.randn(ambient_dim, manifold_dim, generator=generator)
     Q, _ = torch.linalg.qr(raw)
     basis = Q  # (ambient_dim, manifold_dim), orthonormal columns
-    z = torch.randn(n_samples, manifold_dim, generator=g)
+    z = torch.randn(n_samples, manifold_dim, generator=generator)
     points = z @ basis.T
     # Center to origin (bias-free); standardize scale for numerical stability.
     points = points - points.mean(dim=0, keepdim=True)
@@ -520,6 +526,7 @@ def sample_swiss_roll(
     ambient_dim: int,
     hole: float = 0.1,
     seed: int = 0,
+    generator: torch.Generator | None = None,
 ) -> Tensor:
     """Classic Swiss roll (2D manifold) embedded randomly in R^{ambient_dim}.
 
@@ -531,9 +538,10 @@ def sample_swiss_roll(
     """
     if ambient_dim < 3:
         raise ValueError("ambient_dim must be >= 3 for Swiss roll embedding")
-    g = torch.Generator().manual_seed(seed)
+    if generator is None:
+        generator = torch.Generator().manual_seed(seed)
     # Parametric coordinates in [0, 1]
-    t = 1.5 * torch.pi * (1 + 2 * torch.rand(n_samples, generator=g))
+    t = 1.5 * torch.pi * (1 + 2 * torch.rand(n_samples, generator=generator))
     # Hole: exclude central region by scaling the radial component
     scale = 1.0 - hole
     x = scale * t.cos() * t
@@ -542,7 +550,7 @@ def sample_swiss_roll(
     points_r3 = torch.stack([x, y, z], dim=1)  # (n_samples, 3)
 
     # Random linear embedding: R^3 → R^ambient_dim
-    embed = torch.randn(3, ambient_dim, generator=g)
+    embed = torch.randn(3, ambient_dim, generator=generator)
     embed = embed / (embed.norm(dim=0, keepdim=True) + 1e-8)
     points = points_r3 @ embed
 
@@ -551,13 +559,20 @@ def sample_swiss_roll(
     return points.to(torch.float32)
 
 
-def sample_white_noise(*, n_samples: int, ambient_dim: int = 32, seed: int = 0) -> Tensor:
+def sample_white_noise(
+    *,
+    n_samples: int,
+    ambient_dim: int = 32,
+    seed: int = 0,
+    generator: torch.Generator | None = None,
+) -> Tensor:
     """Generate baseline white-noise cloud N(0, I_ambient).
 
     Ground-truth intrinsic dimension: ambient_dim (full ambient space).
     """
-    g = torch.Generator().manual_seed(seed)
-    return torch.randn(n_samples, ambient_dim, generator=g, dtype=torch.float32)
+    if generator is None:
+        generator = torch.Generator().manual_seed(seed)
+    return torch.randn(n_samples, ambient_dim, generator=generator, dtype=torch.float32)
 
 
 class HyperplaneSampler:
@@ -586,6 +601,7 @@ class HyperplaneSampler:
         self.M = M
         self.seed = seed
         self.device = device
+        self.generator = torch.Generator().manual_seed(seed)  # persistent generator
 
     def sample(self, B: int, T: int) -> Tensor:
         """Return a batch of sequences on the hyperplane.
@@ -599,7 +615,7 @@ class HyperplaneSampler:
             n_samples=B * T,
             ambient_dim=self.N,
             manifold_dim=self.M,
-            seed=self.seed,
+            generator=self.generator,  # use persistent generator
         )
         return points.view(B, T, self.N).to(self.device)
 

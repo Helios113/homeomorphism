@@ -8,6 +8,9 @@ Usage:
   .venv/bin/python experiments/run_baseline_configs_gpu.py --quick
 """
 
+.. deprecated:: 2025-04
+    This script is deprecated. Use :mod:`experiments.baseline_runner` instead:
+        python experiments/baseline_runner.py --model gpt2 --baseline-group groupA --device cuda
 from __future__ import annotations
 
 import argparse
